@@ -257,7 +257,7 @@ void ethernet_service_start(void)
                 "eth-service",
                 12288,
                 NULL,
-                23,
+                22,
                 &eth_ctx.task_handle);
 }
 

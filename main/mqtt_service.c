@@ -379,7 +379,7 @@ void mqtt_service_start(void)
                 "mqtt-service",
                 8192,
                 NULL,
-                20,
+                19,
                 &mqtt_ctx.task_handle);
 }
 

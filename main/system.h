@@ -1,39 +1,71 @@
-// system.h - Updated MQTT supervisor section
+// system.h - CORRECTED VERSION
 #ifndef SYSTEM_H
 #define SYSTEM_H
 
 #include "supervisor.h"
 #include "ethernet_service.h"
 #include "mqtt_service.h"
+#include "dummy_temperature_service.h"
 #include "esp_task_wdt.h"
 
-// ------------------------------------------------------------
-// Ethernet Supervisor Service
-// ------------------------------------------------------------
-void ethernet_supervisor_service(void* arg) {
-    ESP_LOGI("eth-super", "Ethernet supervisor service starting");
+
+// ============================================================
+// SUPERVISOR TEMPLATE MACROS
+// ============================================================
+
+// Generic supervisor template - UPDATED with _service_ prefix
+#define DEFINE_SERVICE_SUPERVISOR(service_name, check_func, queue_func) \
+void service_name##_supervisor(void* arg) { \
+    ESP_LOGI(#service_name"-super", #service_name" supervisor starting"); \
+    service_name##_service_start(); \  /* CHANGED: Added _service_ */ \
+    \
+    int max_wait = 50; \
+    QueueHandle_t queue = NULL; \
+    while (max_wait-- > 0 && queue == NULL) { \
+        queue = queue_func(); \
+        if (queue == NULL) vTaskDelay(10 / portTICK_PERIOD_MS); \
+    } \
+    \
+    if (queue == NULL) { \
+        ESP_LOGE(#service_name"-super", "Failed to get queue"); \
+        vTaskDelete(NULL); \
+        return; \
+    } \
+    \
+    ESP_LOGI(#service_name"-super", #service_name" supervisor running"); \
+    while (1) { \
+        /* Generic supervisor logic */ \
+        if (check_func() == false) { \
+            ESP_LOGW(#service_name"-super", "Service health check failed"); \
+        } \
+        vTaskDelay(1000 / portTICK_PERIOD_MS); \
+    } \
+    vTaskDelete(NULL); \
+}
+
+// ============================================================
+// SERVICE-SPECIFIC SUPERVISORS (Using template)
+// ============================================================
+
+// Ethernet supervisor (using template) - UPDATED function names
+void ethernet_supervisor(void* arg) {
+    ESP_LOGI("ethernet-super", "Ethernet supervisor starting");
+    ethernet_service_start();  /* CORRECT function name */
     
-    // Start the Ethernet service
-    ethernet_service_start();
-    
-    // Wait for queue
     int max_wait = 50;
-    QueueHandle_t eth_queue = NULL;
-    
-    while (max_wait-- > 0 && eth_queue == NULL) {
-        eth_queue = ethernet_service_get_queue();
-        if (eth_queue == NULL) {
-            vTaskDelay(10 / portTICK_PERIOD_MS);
-        }
+    QueueHandle_t queue = NULL;
+    while (max_wait-- > 0 && queue == NULL) {
+        queue = ethernet_service_get_queue();
+        if (queue == NULL) vTaskDelay(10 / portTICK_PERIOD_MS);
     }
     
-    if (eth_queue == NULL) {
-        ESP_LOGE("eth-super", "Failed to get Ethernet queue after waiting");
+    if (queue == NULL) {
+        ESP_LOGE("ethernet-super", "Failed to get Ethernet queue");
         vTaskDelete(NULL);
         return;
     }
     
-    ESP_LOGI("eth-super", "Ethernet queue obtained, monitoring events");
+    ESP_LOGI("ethernet-super", "Ethernet supervisor running");
     
     // Register with watchdog if enabled
     #ifdef CONFIG_ESP_TASK_WDT
@@ -41,54 +73,36 @@ void ethernet_supervisor_service(void* arg) {
     #endif
     
     while (1) {
+        // Check queue for events
         eth_service_message_t msg;
-        
-        if (xQueueReceive(eth_queue, &msg, 1000 / portTICK_PERIOD_MS) == pdTRUE) {
-            // Handle all event types
+        if (xQueueReceive(queue, &msg, 1000 / portTICK_PERIOD_MS) == pdTRUE) {
             switch (msg.type) {
                 case ETH_EVENT_CONNECTED:
-                    ESP_LOGI("eth-super", "Ethernet connected");
+                    ESP_LOGI("ethernet-super", "Ethernet connected");
                     break;
-                    
                 case ETH_EVENT_DISCONNECTED:
-                    ESP_LOGW("eth-super", "Ethernet disconnected");
+                    ESP_LOGW("ethernet-super", "Ethernet disconnected");
                     break;
-                    
                 case ETH_EVENT_GOT_IP:
-                    ESP_LOGI("eth-super", "Got IP: %s", msg.data.got_ip.ip);
+                    ESP_LOGI("ethernet-super", "Got IP: %s", msg.data.got_ip.ip);
                     break;
-                    
-                case ETH_EVENT_STARTED:   // Added
-                    ESP_LOGI("eth-super", "Ethernet started");
+                case ETH_EVENT_STARTED:
+                    ESP_LOGI("ethernet-super", "Ethernet started");
                     break;
-                    
-                case ETH_EVENT_STOPPED:   // Added
-                    ESP_LOGW("eth-super", "Ethernet stopped");
+                case ETH_EVENT_STOPPED:
+                    ESP_LOGW("ethernet-super", "Ethernet stopped");
                     break;
-                    
                 case ETH_EVENT_ERROR:
-                    ESP_LOGE("eth-super", "Ethernet hardware error");
+                    ESP_LOGE("ethernet-super", "Ethernet hardware error");
                     #ifdef CONFIG_ESP_TASK_WDT
                     esp_task_wdt_delete(NULL);
                     #endif
-                    vTaskDelay(100 / portTICK_PERIOD_MS);
                     vTaskDelete(NULL);
                     return;
-                    
                 default:
-                    ESP_LOGW("eth-super", "Unknown Ethernet event: %d", msg.type);
+                    ESP_LOGW("ethernet-super", "Unknown Ethernet event: %d", msg.type);
                     break;
             }
-        }
-        
-        // Check if Ethernet service is still alive
-        if (ethernet_service_get_queue() == NULL) {
-            ESP_LOGE("eth-super", "Ethernet service died");
-            #ifdef CONFIG_ESP_TASK_WDT
-            esp_task_wdt_delete(NULL);
-            #endif
-            vTaskDelete(NULL);
-            return;
         }
         
         // Pet watchdog if enabled
@@ -99,38 +113,31 @@ void ethernet_supervisor_service(void* arg) {
         vTaskDelay(100 / portTICK_PERIOD_MS);
     }
     
-    // Clean shutdown
     #ifdef CONFIG_ESP_TASK_WDT
     esp_task_wdt_delete(NULL);
     #endif
     vTaskDelete(NULL);
 }
 
-// ------------------------------------------------------------
-// MQTT Supervisor Service
-// ------------------------------------------------------------
-void mqtt_supervisor_service(void* arg) {
-    ESP_LOGI("mqtt-super", "MQTT supervisor service starting");
-    
-    mqtt_service_start();
+// MQTT supervisor (using template) - UPDATED function names  
+void mqtt_supervisor(void* arg) {
+    ESP_LOGI("mqtt-super", "MQTT supervisor starting");
+    mqtt_service_start();  /* CORRECT function name */
     
     int max_wait = 50;
-    QueueHandle_t mqtt_queue = NULL;
-    
-    while (max_wait-- > 0 && mqtt_queue == NULL) {
-        mqtt_queue = mqtt_service_get_queue();
-        if (mqtt_queue == NULL) {
-            vTaskDelay(10 / portTICK_PERIOD_MS);
-        }
+    QueueHandle_t queue = NULL;
+    while (max_wait-- > 0 && queue == NULL) {
+        queue = mqtt_service_get_queue();
+        if (queue == NULL) vTaskDelay(10 / portTICK_PERIOD_MS);
     }
     
-    if (mqtt_queue == NULL) {
-        ESP_LOGE("mqtt-super", "Failed to get MQTT queue after waiting");
+    if (queue == NULL) {
+        ESP_LOGE("mqtt-super", "Failed to get MQTT queue");
         vTaskDelete(NULL);
         return;
     }
     
-    ESP_LOGI("mqtt-super", "MQTT queue obtained, monitoring events");
+    ESP_LOGI("mqtt-super", "MQTT supervisor running");
     
     #ifdef CONFIG_ESP_TASK_WDT
     esp_task_wdt_add(NULL);
@@ -139,58 +146,40 @@ void mqtt_supervisor_service(void* arg) {
     while (1) {
         mqtt_service_message_t msg;
         
-        if (xQueueReceive(mqtt_queue, &msg, 1000 / portTICK_PERIOD_MS) == pdTRUE) {
+        if (xQueueReceive(queue, &msg, 1000 / portTICK_PERIOD_MS) == pdTRUE) {
             switch (msg.type) {
                 case MQTT_SERVICE_EVENT_CONNECTED:
                     ESP_LOGI("mqtt-super", "MQTT connected");
                     break;
-                    
                 case MQTT_SERVICE_EVENT_DISCONNECTED:
                     ESP_LOGW("mqtt-super", "MQTT disconnected");
                     break;
-                    
                 case MQTT_SERVICE_EVENT_MESSAGE_RECEIVED:
                     ESP_LOGI("mqtt-super", "MQTT message: %s -> %s", 
                             msg.data.message.topic, msg.data.message.data);
                     break;
-                    
                 case MQTT_SERVICE_EVENT_PUBLISHED:
                     ESP_LOGI("mqtt-super", "MQTT published to %s, msg_id=%d",
                             msg.data.published.topic, msg.data.published.msg_id);
                     break;
-                    
                 case MQTT_SERVICE_EVENT_SUBSCRIBED:
                     ESP_LOGI("mqtt-super", "MQTT subscribed to %s, qos=%d",
                             msg.data.subscribed.topic, msg.data.subscribed.qos);
                     break;
-                    
                 case MQTT_SERVICE_EVENT_STARTED:
                     ESP_LOGI("mqtt-super", "MQTT service started");
                     break;
-                    
                 case MQTT_SERVICE_EVENT_STOPPED:
                     ESP_LOGW("mqtt-super", "MQTT service stopped");
                     break;
-                    
                 case MQTT_SERVICE_EVENT_ERROR:
                     ESP_LOGE("mqtt-super", "MQTT error: %s (code: 0x%x)",
                             msg.data.error.error_msg, msg.data.error.error_code);
                     break;
-                    
                 default:
                     ESP_LOGW("mqtt-super", "Unknown MQTT event: %d", msg.type);
                     break;
             }
-        }
-        
-        // Check if MQTT service is still alive
-        if (mqtt_service_get_queue() == NULL) {
-            ESP_LOGE("mqtt-super", "MQTT service died");
-            #ifdef CONFIG_ESP_TASK_WDT
-            esp_task_wdt_delete(NULL);
-            #endif
-            vTaskDelete(NULL);
-            return;
         }
         
         // Check if Ethernet still has IP
@@ -211,15 +200,88 @@ void mqtt_supervisor_service(void* arg) {
     vTaskDelete(NULL);
 }
 
-// ------------------------------------------------------------
-// Service Configuration for Supervisor
-// ------------------------------------------------------------
+// In system.h, update the dummy_temperature_supervisor function:
+void dummy_temperature_supervisor(void* arg) {
+    ESP_LOGI("dummy-temp-super", "Dummy temperature supervisor starting");
+    dummy_temperature_service_start();
+    
+    int max_wait = 50;
+    QueueHandle_t queue = NULL;
+    while (max_wait-- > 0 && queue == NULL) {
+        queue = dummy_temperature_service_get_queue();
+        if (queue == NULL) vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+    
+    if (queue == NULL) {
+        ESP_LOGE("dummy-temp-super", "Failed to get dummy temperature queue");
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    ESP_LOGI("dummy-temp-super", "Dummy temperature supervisor running");
+    
+    // Register with watchdog if enabled
+    #ifdef CONFIG_ESP_TASK_WDT
+    esp_task_wdt_add(NULL);
+    #endif
+    
+    uint32_t last_message_count = 0;
+    uint32_t stale_count = 0;
+    
+    while (1) {
+        // Monitor temperature readings from queue
+        float temperature;
+        if (xQueueReceive(queue, &temperature, 1000 / portTICK_PERIOD_MS) == pdTRUE) {
+            ESP_LOGI("dummy-temp-super", "Monitor: %.2f°C", temperature);
+            
+            // Reset stale counter on new data
+            stale_count = 0;
+        } else {
+            // No data in queue - check if service is still publishing
+            uint32_t current_count = dummy_temperature_service_get_message_count();  // USE PUBLIC API
+            if (current_count == last_message_count) {
+                stale_count++;
+                if (stale_count > 10) {  // 10 seconds without new data
+                    ESP_LOGW("dummy-temp-super", "No new temperature data for %d seconds", 
+                            stale_count);
+                }
+            }
+            last_message_count = current_count;
+        }
+        
+        // Check service health
+        if (!dummy_temperature_service_is_healthy()) {
+            ESP_LOGW("dummy-temp-super", "Dummy temperature service health check failed");
+        }
+        
+        // Pet watchdog if enabled
+        #ifdef CONFIG_ESP_TASK_WDT
+        esp_task_wdt_reset();
+        #endif
+        
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+    
+    #ifdef CONFIG_ESP_TASK_WDT
+    esp_task_wdt_delete(NULL);
+    #endif
+    vTaskDelete(NULL);
+}
+// ============================================================
+// SERVICE REGISTRY
+// ============================================================
+
 const service_def_t services[] = {
-    // Name            Function                    Stack   Prio  Restart         Essential  Context
-    {"ethernet",       ethernet_supervisor_service, 12288, 23,   RESTART_ALWAYS,  true,    NULL},
-    {"mqtt",           mqtt_supervisor_service,     8192,  20,   RESTART_ALWAYS,  false,   NULL},
-    // Add other services as needed
-    {NULL, NULL, 0, 0, RESTART_NEVER, false, NULL}  // Terminator
+    // Core services
+    {"ethernet",   ethernet_supervisor, 12288, 23, RESTART_ALWAYS, true,  NULL},
+    {"mqtt",       mqtt_supervisor,     8192,  20, RESTART_ALWAYS, false, NULL},
+       // Dummy temperature service
+    {"dummy-temp", dummy_temperature_supervisor, 4096, 10, RESTART_ALWAYS, false, NULL},
+   
+    // Add new services HERE without modifying above
+    // {"temperature", temperature_supervisor, 4096, 10, RESTART_ALWAYS, false, NULL},
+    
+    {NULL, NULL, 0, 0, RESTART_NEVER, false, NULL}
 };
 
 #endif // SYSTEM_H

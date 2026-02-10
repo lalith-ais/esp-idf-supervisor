@@ -463,3 +463,9 @@ esp_err_t mqtt_service_unsubscribe(const char *topic)
     
     return ESP_OK;
 }
+
+bool mqtt_service_can_publish(void) {
+    return mqtt_ctx.is_running &&        // Service is running
+           mqtt_ctx.is_connected &&      // MQTT is connected to broker
+           ethernet_service_has_ip();    // Ethernet has valid IP
+}

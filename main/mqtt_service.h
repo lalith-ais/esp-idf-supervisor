@@ -61,6 +61,7 @@ void mqtt_service_stop(void);
 QueueHandle_t mqtt_service_get_queue(void);
 bool mqtt_service_is_connected(void);
 bool mqtt_service_is_running(void);
+bool mqtt_service_can_publish(void);
 
 // Configuration API
 void mqtt_service_set_config(const mqtt_config_t *config);

@@ -5,7 +5,7 @@
 #include "supervisor.h"
 #include "ethernet_service.h"
 #include "mqtt_service.h"
-#include "dummy_temperature_service.h"
+#include "ds18b20_temp.h"
 #include "esp_task_wdt.h"
 
 
@@ -200,25 +200,25 @@ void mqtt_supervisor(void* arg) {
     vTaskDelete(NULL);
 }
 
-// In system.h, update the dummy_temperature_supervisor function:
-void dummy_temperature_supervisor(void* arg) {
-    ESP_LOGI("dummy-temp-super", "Dummy temperature supervisor starting");
-    dummy_temperature_service_start();
+// ds18b20 temerature servoce
+void ds18b20_temp_supervisor(void* arg) {
+    ESP_LOGI("ds18b20temp-super", "ds18b20 temperature supervisor starting");
+    ds18b20_temp_service_start();
     
     int max_wait = 50;
     QueueHandle_t queue = NULL;
     while (max_wait-- > 0 && queue == NULL) {
-        queue = dummy_temperature_service_get_queue();
+        queue = ds18b20_temp_service_get_queue();
         if (queue == NULL) vTaskDelay(10 / portTICK_PERIOD_MS);
     }
     
     if (queue == NULL) {
-        ESP_LOGE("dummy-temp-super", "Failed to get dummy temperature queue");
+        ESP_LOGE("ds18b20-temp-super", "Failed to get ds18b20 temperature queue");
         vTaskDelete(NULL);
         return;
     }
     
-    ESP_LOGI("dummy-temp-super", "Dummy temperature supervisor running");
+    ESP_LOGI("ds18b20-temp-super", "ds18b20 temperature supervisor running");
     
     // Register with watchdog if enabled
     #ifdef CONFIG_ESP_TASK_WDT
@@ -232,17 +232,17 @@ void dummy_temperature_supervisor(void* arg) {
         // Monitor temperature readings from queue
         float temperature;
         if (xQueueReceive(queue, &temperature, 1000 / portTICK_PERIOD_MS) == pdTRUE) {
-            ESP_LOGI("dummy-temp-super", "Monitor: %.2f°C", temperature);
+            ESP_LOGI("18b20-temp-super", "Monitor: %.2f°C", temperature);
             
             // Reset stale counter on new data
             stale_count = 0;
         } else {
             // No data in queue - check if service is still publishing
-            uint32_t current_count = dummy_temperature_service_get_message_count();  // USE PUBLIC API
+            uint32_t current_count = ds18b20_temp_service_get_message_count();  // USE PUBLIC API
             if (current_count == last_message_count) {
                 stale_count++;
                 if (stale_count > 10) {  // 10 seconds without new data
-                    ESP_LOGW("dummy-temp-super", "No new temperature data for %d seconds", 
+                    ESP_LOGW("ds18b20-temp-super", "No new temperature data for %d seconds", 
                             stale_count);
                 }
             }
@@ -250,8 +250,8 @@ void dummy_temperature_supervisor(void* arg) {
         }
         
         // Check service health
-        if (!dummy_temperature_service_is_healthy()) {
-            ESP_LOGW("dummy-temp-super", "Dummy temperature service health check failed");
+        if (!ds18b20_temp_service_is_healthy()) {
+            ESP_LOGW("ds18b20-temp-super", "ds18b20 temperature service health check failed");
         }
         
         // Pet watchdog if enabled
@@ -275,12 +275,7 @@ const service_def_t services[] = {
     // Core services
     {"ethernet",   ethernet_supervisor, 12288, 23, RESTART_ALWAYS, true,  NULL},
     {"mqtt",       mqtt_supervisor,     8192,  20, RESTART_ALWAYS, false, NULL},
-       // Dummy temperature service
-    {"dummy-temp", dummy_temperature_supervisor, 4096, 10, RESTART_ALWAYS, false, NULL},
-   
-    // Add new services HERE without modifying above
-    // {"temperature", temperature_supervisor, 4096, 10, RESTART_ALWAYS, false, NULL},
-    
+    {"ds18b20-temp", ds18b20_temp_supervisor, 4096, 10, RESTART_ALWAYS, false, NULL},
     {NULL, NULL, 0, 0, RESTART_NEVER, false, NULL}
 };
 

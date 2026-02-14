@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 // Configuration constants
-#define DS18B20_MAX_SENSORS     2   // Maximum number of DS18B20 sensors supported
+#define DS18B20_MAX_SENSORS     4   // Maximum number of DS18B20 sensors supported
 #define DS18B20_DEFAULT_GPIO    6   // 
 
 // Public API matching your pattern

@@ -1,0 +1,10 @@
+menu "Example Configuration"
+
+    config MQTT_BROKER_URI 
+        string "MQTT Broker Uri"
+        default "mqtt://192.168.124.4"
+        help
+           mqtt broaker url 
+
+
+endmenu

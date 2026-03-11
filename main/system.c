@@ -27,6 +27,7 @@
 #include "ethernet_service.h"
 #include "mqtt_service.h"
 #include "ds18b20_temp.h"
+#include "display_service.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
@@ -282,6 +283,34 @@ void ds18b20_temp_supervisor(void *arg)
 }
 
 /* =========================================================================
+ * display_supervisor
+ *
+ * Manages the TM1637 display service.  The display service has no event
+ * queue of its own that the supervisor needs to drain -- it is self-contained.
+ * The supervisor simply starts it, then loops doing periodic health checks.
+ * ========================================================================= */
+
+void display_supervisor(void *arg)
+{
+    static const char *TAG = "display-super";
+    ESP_LOGI(TAG, "Display supervisor starting");
+
+    display_service_stop();   /* clean up any prior instance */
+    display_service_start();
+
+    while (1) {
+        if (!display_service_is_running()) {
+            ESP_LOGW(TAG, "Display service stopped unexpectedly");
+            /* Supervisor will handle restart via restart policy */
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+
+    vTaskDelete(NULL);
+}
+
+/* =========================================================================
  * Service registry
  *
  * FIX: priority values now come from priorities.h — no magic numbers.
@@ -292,5 +321,6 @@ const service_def_t services[] = {
     {"ethernet",     ethernet_supervisor,      12288, PRIO_ETH_SUPERVISOR,    RESTART_ALWAYS, true,  NULL, 30},
     {"mqtt",         mqtt_supervisor,           8192, PRIO_MQTT_SUPERVISOR,   RESTART_ALWAYS, false, NULL, 30},
     {"ds18b20-temp", ds18b20_temp_supervisor,   4096, PRIO_DS18B20_SUPERVISOR,RESTART_ALWAYS, false, NULL, 60},
+    {"display",      display_supervisor,        4096, PRIO_DS18B20_SUPERVISOR,RESTART_ALWAYS, false, NULL, 0},
     {NULL, NULL, 0, 0, RESTART_NEVER, false, NULL, 0}   /* sentinel */
 };

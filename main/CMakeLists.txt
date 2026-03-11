@@ -8,6 +8,7 @@ idf_component_register(
         "mqtt_service.c"
         "app_mqtt.c"
         "ds18b20_temp.c"
+        "display_service.c"
     INCLUDE_DIRS
         "."
     REQUIRES
@@ -17,6 +18,7 @@ idf_component_register(
         esp_netif
         driver
         mqtt
+        esp_lcd
     PRIV_REQUIRES
         espressif__onewire_bus
 )

@@ -32,6 +32,7 @@
 #include "ethernet_service.h"
 #include "supervisor.h"
 #include "priorities.h"
+#include "display_service.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -431,6 +432,11 @@ static void mqtt_message_callback(const char *topic, const char *data, void *ctx
         else if (strcmp(data, "reboot")  == 0) ESP_LOGI(TAG, "CMD: reboot");
     }
 
+    /* Route system time to display service */
+    if (strcmp(topic, "/SYS/time") == 0) {
+        display_service_set_time(data);
+    }
+
     mqtt_service_message_t msg = { .type = MQTT_SERVICE_EVENT_MESSAGE_RECEIVED };
     strncpy(msg.data.message.topic, topic, sizeof(msg.data.message.topic) - 1);
     strncpy(msg.data.message.data,  data,  sizeof(msg.data.message.data)  - 1);
@@ -450,10 +456,9 @@ static void mqtt_connection_callback(bool connected, void *ctx)
     if (connected) {
         ESP_LOGI(TAG, "MQTT connected");
         mqtt_client_subscribe(s_ctx.config.subscribe_topic, 0);
+        mqtt_client_subscribe("/SYS/time", 0);   /* [display] system time topic */
 
-        /* [5] Publish "online" retained to status topic so Node-RED always
-         * knows the node is alive.  The broker's LWT will publish "offline"
-         * retained automatically on unclean disconnect. */
+        /* [5] Publish "online" retained to status topic */
         char status_topic[80];
         snprintf(status_topic, sizeof(status_topic), "%s%s",
                  s_ctx.config.publish_topic, MQTT_STATUS_SUFFIX);
@@ -462,6 +467,7 @@ static void mqtt_connection_callback(bool connected, void *ctx)
         ESP_LOGI(TAG, "Published: %s = online (retained)", status_topic);
     } else {
         ESP_LOGI(TAG, "MQTT disconnected");
+        display_service_set_mqtt_connected(false);   /* show ---- on display */
     }
 
     queue_send_warn(s_ctx.event_queue, &msg,  /* [1] */

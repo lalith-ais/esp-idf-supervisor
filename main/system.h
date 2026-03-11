@@ -18,6 +18,7 @@
 #include "ethernet_service.h"
 #include "mqtt_service.h"
 #include "ds18b20_temp.h"
+#include "display_service.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +28,7 @@ extern "C" {
 void ethernet_supervisor(void *arg);
 void mqtt_supervisor(void *arg);
 void ds18b20_temp_supervisor(void *arg);
+void display_supervisor(void *arg);
 
 /* NULL-terminated service registry (defined in system.c) */
 extern const service_def_t services[];

@@ -14,6 +14,7 @@
  *   10  ds18b20_temp_supervisor
  *    5  ds18b20-temp-task (inner)
  *    5  mqtt-publish (inner)
+ *    4  display-service (inner)  - low priority, purely I/O bound
  */
 
 /* Supervisor (must be > all service supervisors) */
@@ -31,5 +32,8 @@
 /* DS18B20 temperature layer */
 #define PRIO_DS18B20_SUPERVISOR     10
 #define PRIO_DS18B20_SERVICE        5
+
+/* TM1637 display layer -- low priority, purely I/O bound via bit-bang */
+#define PRIO_DISPLAY_SERVICE        4
 
 #endif /* PRIORITIES_H */

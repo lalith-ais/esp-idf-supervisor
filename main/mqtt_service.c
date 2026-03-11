@@ -432,9 +432,12 @@ static void mqtt_message_callback(const char *topic, const char *data, void *ctx
         else if (strcmp(data, "reboot")  == 0) ESP_LOGI(TAG, "CMD: reboot");
     }
 
-    /* Route system time to display service */
+    /* Route topics to display service */
     if (strcmp(topic, "/SYS/time") == 0) {
         display_service_set_time(data);
+    }
+    if (strcmp(topic, "/controller/text") == 0) {
+        display_service_set_text(data);
     }
 
     mqtt_service_message_t msg = { .type = MQTT_SERVICE_EVENT_MESSAGE_RECEIVED };
@@ -456,7 +459,8 @@ static void mqtt_connection_callback(bool connected, void *ctx)
     if (connected) {
         ESP_LOGI(TAG, "MQTT connected");
         mqtt_client_subscribe(s_ctx.config.subscribe_topic, 0);
-        mqtt_client_subscribe("/SYS/time", 0);   /* [display] system time topic */
+        mqtt_client_subscribe("/SYS/time", 0);        /* [display] clock topic    */
+        mqtt_client_subscribe("/controller/text", 0); /* [display] text zone      */
 
         /* [5] Publish "online" retained to status topic */
         char status_topic[80];

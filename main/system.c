@@ -285,7 +285,7 @@ void ds18b20_temp_supervisor(void *arg)
 /* =========================================================================
  * display_supervisor
  *
- * Manages the TM1637 display service.  The display service has no event
+ * Manages the display service.  The display service has no event
  * queue of its own that the supervisor needs to drain -- it is self-contained.
  * The supervisor simply starts it, then loops doing periodic health checks.
  * ========================================================================= */

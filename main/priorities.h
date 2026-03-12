@@ -33,7 +33,7 @@
 #define PRIO_DS18B20_SUPERVISOR     10
 #define PRIO_DS18B20_SERVICE        5
 
-/* TM1637 display layer -- low priority, purely I/O bound via bit-bang */
+/* display service  -- low priority, purely I/O bound via bit-bang */
 #define PRIO_DISPLAY_SERVICE        4
 
 #endif /* PRIORITIES_H */

@@ -537,7 +537,9 @@ void display_service_stop(void)
     display_msg_t msg = { .type = DISPLAY_MSG_STOP };
     xQueueSend(s_ctx.queue, &msg, pdMS_TO_TICKS(200));
     vTaskDelay(pdMS_TO_TICKS(500));
+    if (s_ctx.queue) { vQueueDelete(s_ctx.queue); s_ctx.queue = NULL; }
     s_ctx.task_handle = NULL;
+    s_ctx.is_running = false;
 }
 
 bool display_service_is_running(void) { return s_ctx.is_running; }

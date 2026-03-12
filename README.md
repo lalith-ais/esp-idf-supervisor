@@ -49,6 +49,8 @@ Tested on real hardware: **ESP32-P4** with internal Ethernet (IP101 PHY), MQTT b
 
 ## Design Philosophy
 
+https://gist.github.com/lalith-ais/1036a2538996b3b46d788a4181b656c3
+
 This codebase deliberately avoids mutexes, semaphores, and shared memory. Every piece of state is **owned by exactly one task**. All inter-task communication happens exclusively through **FreeRTOS queues**.
 
 This follows the [Actor model](https://en.wikipedia.org/wiki/Actor_model) — the same principle behind Erlang's processes and Go's channels:

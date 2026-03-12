@@ -2,7 +2,7 @@
 
 > A FreeRTOS service supervision framework for ESP-IDF v5.x — start, monitor, and automatically restart application tasks, inspired by Unix `init` / `systemd`.
 
-Tested on real hardware: **ESP32-P4** with internal Ethernet (IP101 PHY), MQTT broker, and DS18B20 temperature sensors.
+Tested on real hardware: **ESP32-P4** with internal Ethernet (IP101 PHY), MQTT broker, DS18B20 temperature sensors and SSD1306 i2c OLED display
 
 ---
 

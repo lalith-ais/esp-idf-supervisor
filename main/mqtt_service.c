@@ -10,12 +10,12 @@
  *      any per-unit sdkconfig changes.
  *
  *      Topic layout example for MAC AA:BB:CC:A1:B2:C3:
- *        client_id       ESP32P4-AABBCCA1B2C3
- *        publish_topic   /ESP32P4/AABBCCA1B2C3
- *        subscribe_topic /ESP32P4/AABBCCA1B2C3/cmd
- *        lwt_topic       /ESP32P4/AABBCCA1B2C3/status
- *        health_topic    /ESP32P4/AABBCCA1B2C3/health
- *        text_cmd_topic  /ESP32P4/AABBCCA1B2C3/text
+ *        client_id       AABBCCA1B2C3
+ *        publish_topic   /AABBCCA1B2C3
+ *        subscribe_topic /AABBCCA1B2C3/cmd
+ *        lwt_topic       /AABBCCA1B2C3/status
+ *        health_topic    /AABBCCA1B2C3/health
+ *        text_cmd_topic  /AABBCCA1B2C3/text
  *
  * CHANGES retained from v1.3:
  *  [5] Last-Will-and-Testament (LWT)
@@ -95,8 +95,8 @@ static void mqtt_derive_node_id(void)
 #endif
 
 /* Derived topic helpers -- built at runtime from status_topic */
-/* status_topic  = publish_topic + "/status"  (e.g. /ESP32P4/AABBCCA1B2C3/status) */
-/* health_topic  = publish_topic + "/health"  (e.g. /ESP32P4/AABBCCA1B2C3/health) */
+/* status_topic  = publish_topic + "/status"  (e.g. /AABBCCA1B2C3/status) */
+/* health_topic  = publish_topic + "/health"  (e.g. /AABBCCA1B2C3/health) */
 #define MQTT_STATUS_SUFFIX   "/status"
 #define MQTT_HEALTH_SUFFIX   "/health"
 
@@ -278,15 +278,15 @@ static void mqtt_service_task(void *arg)
         strncpy(s_ctx.config.broker_uri, CONFIG_MQTT_BROKER_URI,
                 sizeof(s_ctx.config.broker_uri) - 1);
 
-        /* client_id  ->  "ESP32P4-AABBCCA1B2C3"  [7] */
+        /* client_id  ->  "AABBCCA1B2C3"  [7] */
         snprintf(s_ctx.config.client_id, sizeof(s_ctx.config.client_id),
                  "%s%s", CONFIG_MQTT_CLIENT_ID_PREFIX, s_mac_id);
 
-        /* publish_topic  ->  "/ESP32P4/AABBCCA1B2C3"  [7] */
+        /* publish_topic  ->  "/AABBCCA1B2C3"  [7] */
         snprintf(s_ctx.config.publish_topic, sizeof(s_ctx.config.publish_topic),
                  "%s/%s", CONFIG_MQTT_TOPIC_ROOT, s_mac_id);
 
-        /* subscribe_topic  ->  "/ESP32P4/AABBCCA1B2C3/cmd"  [7] */
+        /* subscribe_topic  ->  "/AABBCCA1B2C3/cmd"  [7] */
         snprintf(s_ctx.config.subscribe_topic, sizeof(s_ctx.config.subscribe_topic),
                  "%s/%s/cmd", CONFIG_MQTT_TOPIC_ROOT, s_mac_id);
 
@@ -470,7 +470,7 @@ static void mqtt_message_callback(const char *topic, const char *data, void *ctx
         display_service_set_time(data);
     }
 
-    /* [7] text-command topic is MAC-derived: /ESP32P4/AABBCCA1B2C3/text */
+    /* [7] text-command topic is MAC-derived: /AABBCCA1B2C3/text */
     char text_topic[48];
     snprintf(text_topic, sizeof(text_topic),
              "%s/%s/text", CONFIG_MQTT_TOPIC_ROOT, s_mac_id);
@@ -499,7 +499,7 @@ static void mqtt_connection_callback(bool connected, void *ctx)
         mqtt_client_subscribe(s_ctx.config.subscribe_topic, 0);
         mqtt_client_subscribe("/SYS/time", 0);        /* [display] clock topic    */
 
-        /* [7] text-command topic is MAC-derived: /ESP32P4/AABBCCA1B2C3/text */
+        /* [7] text-command topic is MAC-derived: /AABBCCA1B2C3/text */
         char text_topic[48];
         snprintf(text_topic, sizeof(text_topic),
                  "%s/%s/text", CONFIG_MQTT_TOPIC_ROOT, s_mac_id);

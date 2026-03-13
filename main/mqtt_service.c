@@ -1,24 +1,25 @@
 /*
- * mqtt_service.c  (v1.3 -- LWT + health publish)
+ * mqtt_service.c  (v1.4 -- MAC-derived node ID)
  *
- * CHANGES vs v1.2:
+ * CHANGES vs v1.3:
+ *  [7] MAC-derived node ID
+ *      client_id, publish_topic, subscribe_topic, and the display text-command
+ *      topic are all built at runtime from the Ethernet MAC address (last 6
+ *      bytes formatted as upper-hex, e.g. "AABBCCA1B2C3").  This allows the
+ *      same firmware binary to be flashed on multiple ESP32-P4 units without
+ *      any per-unit sdkconfig changes.
+ *
+ *      Topic layout example for MAC AA:BB:CC:A1:B2:C3:
+ *        client_id       ESP32P4-AABBCCA1B2C3
+ *        publish_topic   /ESP32P4/AABBCCA1B2C3
+ *        subscribe_topic /ESP32P4/AABBCCA1B2C3/cmd
+ *        lwt_topic       /ESP32P4/AABBCCA1B2C3/status
+ *        health_topic    /ESP32P4/AABBCCA1B2C3/health
+ *        text_cmd_topic  /ESP32P4/AABBCCA1B2C3/text
+ *
+ * CHANGES retained from v1.3:
  *  [5] Last-Will-and-Testament (LWT)
- *      Broker auto-publishes  <status_topic>/status = "offline"  (retain=1,
- *      qos=1) if this node loses power or crashes hard without a clean
- *      disconnect.  On clean connect the service publishes "online" with
- *      retain=1 so subscribers always see the current state.
- *
  *  [6] Periodic health publish
- *      Every CONFIG_MQTT_HEALTH_INTERVAL_MS (default 30 s) the service
- *      publishes a JSON payload to <status_topic>/health:
- *        {"uptime_s":<N>,"heap_free":<N>,"ip":"x.x.x.x","crash":"<svc>"}
- *      "crash" is omitted when there is no recorded crash reason.
- *      This replaces the meaningless "Counter: N, Free Heap: N" payload
- *      from the old publish task.
- *
- * Status topic layout (all retained, qos=1):
- *   <status_topic>/status   -- "online" | "offline"  (LWT)
- *   <status_topic>/health   -- JSON health payload
  *
  * HARDENING retained from v1.2:
  *  [1] Queue-full logging
@@ -41,10 +42,35 @@
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "esp_netif.h"
+#include "esp_mac.h"      /* [7] esp_read_mac(), ESP_MAC_ETH */
 #include <string.h>
 #include <stdio.h>
 
 static const char *TAG = "mqtt-service";
+
+/* -------------------------------------------------------------------------
+ * [7] MAC-derived node ID
+ *
+ * s_mac_id is populated once by mqtt_derive_node_id() at task startup,
+ * before any topic strings are built.  It is also declared extern so that
+ * ds18b20_temp.c (and any other service that needs a per-unit topic prefix)
+ * can reference it without duplicating the MAC read.
+ *
+ * If you prefer not to use extern across translation units, move s_mac_id
+ * and mqtt_derive_node_id() into a shared node_id.c / node_id.h module.
+ * ------------------------------------------------------------------------- */
+char s_mac_id[13] = "000000000000";   /* 12 upper-hex digits + NUL  [7] */
+
+static void mqtt_derive_node_id(void)
+{
+    uint8_t mac[6];
+    if (esp_read_mac(mac, ESP_MAC_ETH) == ESP_OK) {
+        snprintf(s_mac_id, sizeof(s_mac_id),
+                 "%02X%02X%02X%02X%02X%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+    ESP_LOGI(TAG, "Node MAC ID: %s", s_mac_id);  /* [7] */
+}
 
 /* -------------------------------------------------------------------------
  * Default config from sdkconfig
@@ -53,14 +79,13 @@ static const char *TAG = "mqtt-service";
 #warning "CONFIG_MQTT_BROKER_URI not set in sdkconfig -- using compile-time fallback"
 #define CONFIG_MQTT_BROKER_URI "mqtt://192.168.1.1"
 #endif
-#ifndef CONFIG_MQTT_CLIENT_ID
-#define CONFIG_MQTT_CLIENT_ID        "ESP32P4-ETH"
+/* [7] client_id and topics are built at runtime from the MAC; only the      */
+/*     prefix/root strings are kept as compile-time constants.               */
+#ifndef CONFIG_MQTT_CLIENT_ID_PREFIX
+#define CONFIG_MQTT_CLIENT_ID_PREFIX    ""
 #endif
-#ifndef CONFIG_MQTT_PUBLISH_TOPIC
-#define CONFIG_MQTT_PUBLISH_TOPIC    "/ESP32P4/NODE1"
-#endif
-#ifndef CONFIG_MQTT_SUBSCRIBE_TOPIC
-#define CONFIG_MQTT_SUBSCRIBE_TOPIC  "/ESP32P4/COMMAND"
+#ifndef CONFIG_MQTT_TOPIC_ROOT
+#define CONFIG_MQTT_TOPIC_ROOT          ""
 #endif
 #ifndef CONFIG_MQTT_PUBLISH_INTERVAL_MS
 #define CONFIG_MQTT_PUBLISH_INTERVAL_MS 5000
@@ -68,13 +93,10 @@ static const char *TAG = "mqtt-service";
 #ifndef CONFIG_MQTT_HEALTH_INTERVAL_MS
 #define CONFIG_MQTT_HEALTH_INTERVAL_MS  30000   /* 30 s health publish */
 #endif
-#ifndef CONFIG_MQTT_NODE_ID
-#define CONFIG_MQTT_NODE_ID             "NODE1"
-#endif
 
 /* Derived topic helpers -- built at runtime from status_topic */
-/* status_topic  = publish_topic + "/status"  (e.g. /ESP32P4/NODE1/status) */
-/* health_topic  = publish_topic + "/health"  (e.g. /ESP32P4/NODE1/health) */
+/* status_topic  = publish_topic + "/status"  (e.g. /ESP32P4/AABBCCA1B2C3/status) */
+/* health_topic  = publish_topic + "/health"  (e.g. /ESP32P4/AABBCCA1B2C3/health) */
 #define MQTT_STATUS_SUFFIX   "/status"
 #define MQTT_HEALTH_SUFFIX   "/health"
 
@@ -248,16 +270,26 @@ static void mqtt_service_task(void *arg)
         return;
     }
 
+    /* [7] Derive MAC-based node ID before building any topic strings */
+    mqtt_derive_node_id();
+
     /* Apply defaults from sdkconfig if not overridden by caller */
     if (strlen(s_ctx.config.broker_uri) == 0) {
-        strncpy(s_ctx.config.broker_uri,     CONFIG_MQTT_BROKER_URI,
+        strncpy(s_ctx.config.broker_uri, CONFIG_MQTT_BROKER_URI,
                 sizeof(s_ctx.config.broker_uri) - 1);
-        strncpy(s_ctx.config.client_id,       CONFIG_MQTT_CLIENT_ID,
-                sizeof(s_ctx.config.client_id) - 1);
-        strncpy(s_ctx.config.publish_topic,   CONFIG_MQTT_PUBLISH_TOPIC,
-                sizeof(s_ctx.config.publish_topic) - 1);
-        strncpy(s_ctx.config.subscribe_topic, CONFIG_MQTT_SUBSCRIBE_TOPIC,
-                sizeof(s_ctx.config.subscribe_topic) - 1);
+
+        /* client_id  ->  "ESP32P4-AABBCCA1B2C3"  [7] */
+        snprintf(s_ctx.config.client_id, sizeof(s_ctx.config.client_id),
+                 "%s%s", CONFIG_MQTT_CLIENT_ID_PREFIX, s_mac_id);
+
+        /* publish_topic  ->  "/ESP32P4/AABBCCA1B2C3"  [7] */
+        snprintf(s_ctx.config.publish_topic, sizeof(s_ctx.config.publish_topic),
+                 "%s/%s", CONFIG_MQTT_TOPIC_ROOT, s_mac_id);
+
+        /* subscribe_topic  ->  "/ESP32P4/AABBCCA1B2C3/cmd"  [7] */
+        snprintf(s_ctx.config.subscribe_topic, sizeof(s_ctx.config.subscribe_topic),
+                 "%s/%s/cmd", CONFIG_MQTT_TOPIC_ROOT, s_mac_id);
+
         s_ctx.config.enabled             = true;
         s_ctx.config.publish_interval_ms = CONFIG_MQTT_PUBLISH_INTERVAL_MS;
         s_ctx.config.health_interval_ms  = CONFIG_MQTT_HEALTH_INTERVAL_MS;  /* [6] */
@@ -305,7 +337,8 @@ static void mqtt_service_task(void *arg)
         }
     }
 
-    ESP_LOGI(TAG, "Connecting to broker: %s (LWT: %s = offline)", s_ctx.config.broker_uri, lwt_topic);
+    ESP_LOGI(TAG, "Connecting to broker: %s (client: %s, LWT: %s = offline)",
+             s_ctx.config.broker_uri, s_ctx.config.client_id, lwt_topic);
     esp_err_t ret = mqtt_client_init(s_ctx.config.broker_uri,
                                       s_ctx.config.client_id,
                                       lwt_topic,      /* [5] LWT topic  */
@@ -436,7 +469,12 @@ static void mqtt_message_callback(const char *topic, const char *data, void *ctx
     if (strcmp(topic, "/SYS/time") == 0) {
         display_service_set_time(data);
     }
-    if (strcmp(topic, "/controller/text") == 0) {
+
+    /* [7] text-command topic is MAC-derived: /ESP32P4/AABBCCA1B2C3/text */
+    char text_topic[48];
+    snprintf(text_topic, sizeof(text_topic),
+             "%s/%s/text", CONFIG_MQTT_TOPIC_ROOT, s_mac_id);
+    if (strcmp(topic, text_topic) == 0) {
         display_service_set_text(data);
     }
 
@@ -460,7 +498,12 @@ static void mqtt_connection_callback(bool connected, void *ctx)
         ESP_LOGI(TAG, "MQTT connected");
         mqtt_client_subscribe(s_ctx.config.subscribe_topic, 0);
         mqtt_client_subscribe("/SYS/time", 0);        /* [display] clock topic    */
-        mqtt_client_subscribe("/controller/text", 0); /* [display] text zone      */
+
+        /* [7] text-command topic is MAC-derived: /ESP32P4/AABBCCA1B2C3/text */
+        char text_topic[48];
+        snprintf(text_topic, sizeof(text_topic),
+                 "%s/%s/text", CONFIG_MQTT_TOPIC_ROOT, s_mac_id);
+        mqtt_client_subscribe(text_topic, 0);          /* [display] text zone      */
 
         /* [5] Publish "online" retained to status topic */
         char status_topic[80];

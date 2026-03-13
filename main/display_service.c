@@ -20,8 +20,11 @@
  *   touch pages outside their range.
  *
  * MQTT TOPICS
- *   /SYS/time          -> display_service_set_time("HH:MM")
- *   /controller/text   -> display_service_set_text("any string")
+ *   /SYS/time                       -> display_service_set_time("HH:MM")
+ *   /ESP32P4/<MACID>/text           -> display_service_set_text("any string")
+ *   (<MACID> is the full 12-char upper-hex Ethernet MAC, e.g. AABBCCA1B2C3)
+ *   Topic subscription is handled by mqtt_service.c -- this service only
+ *   exposes the display_service_set_text() / display_service_set_time() API.
  */
 
 #include "display_service.h"
@@ -94,7 +97,7 @@ typedef struct {
     display_msg_type_t type;
     union {
         char time_str[6];             /* "HH:MM\0" */
-        char text[MAX_TEXT_LEN];      /* arbitrary string from /controller/text */
+        char text[MAX_TEXT_LEN];      /* arbitrary string from /ESP32P4/<MACID>/text */
         bool connected;
     } data;
 } display_msg_t;

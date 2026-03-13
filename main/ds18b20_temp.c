@@ -19,6 +19,14 @@
  *  [MINOR] ds18b20_temp_service_start guard
  *      Checks task_handle OR is_running (not just task_handle) to avoid
  *      double-start after a supervisor restart that cleared task_handle.
+ *
+ *  [7] MAC-derived MQTT topics
+ *      Temperature topics now embed the full Ethernet MAC (upper-hex) so
+ *      that every unit on the same broker uses a unique topic namespace:
+ *        single sensor:  /ESP32P4/AABBCCA1B2C3/temperature
+ *        multi  sensor:  /ESP32P4/AABBCCA1B2C3/temperature/0
+ *                        /ESP32P4/AABBCCA1B2C3/temperature/1  ...
+ *      s_mac_id is populated by mqtt_service before this task publishes.
  */
 
 #include "ds18b20_temp.h"
@@ -33,6 +41,14 @@
 #include "ds18b20.h"
 
 static const char *TAG = "ds18b20-temp";
+
+/* [7] Full 12-char upper-hex MAC string defined in mqtt_service.c.
+ * If you later refactor into a shared node_id.c module, replace this
+ * extern with #include "node_id.h".                                   */
+extern char s_mac_id[];
+
+/* Topic root -- must match CONFIG_MQTT_TOPIC_ROOT in mqtt_service.c   */
+#define MQTT_TOPIC_ROOT  ""
 
 /* Seconds without a successful reading before is_healthy() returns false */
 #define HEALTH_STALE_S   30
@@ -192,16 +208,20 @@ static void ds18b20_temp_task(void *arg)
                 char value[32];
 
                 snprintf(value, sizeof(value), "%.2f", temp);
+
+                /* [7] Topic includes full MAC for per-unit uniqueness */
                 if (s_ctx.sensor_count > 1) {
-                    snprintf(topic, sizeof(topic), "/ESP32P4/temperature/%d", i);
+                    snprintf(topic, sizeof(topic),
+                             "%s/%s/temperature/%d", MQTT_TOPIC_ROOT, s_mac_id, i);
                 } else {
-                    snprintf(topic, sizeof(topic), "/ESP32P4/temperature");
+                    snprintf(topic, sizeof(topic),
+                             "%s/%s/temperature", MQTT_TOPIC_ROOT, s_mac_id);
                 }
 
                 esp_err_t pub = mqtt_service_publish(topic, value, 0, false);
                 if (pub == ESP_OK) {
                     s_ctx.message_count++;
-                    ESP_LOGI(TAG, "Published %s → %s", topic, value);
+                    ESP_LOGI(TAG, "Published %s -> %s", topic, value);
                 } else {
                     ESP_LOGW(TAG, "Publish failed: %s", esp_err_to_name(pub));
                 }

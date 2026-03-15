@@ -1,5 +1,18 @@
 /*
- * mqtt_service.c  (v1.4 -- MAC-derived node ID)
+ * mqtt_service.c  (v1.5 -- relay GPIO control)
+ *
+ * CHANGES vs v1.4:
+ *  [8] Four relay outputs driven directly from the MQTT callback (atomic).
+ *      GPIOs are configured as outputs during mqtt_service_task() startup.
+ *      Topics (MAC-derived, QoS 0):
+ *        /<MACID>/relay1   payload "on" | "off"   -> GPIO 23
+ *        /<MACID>/relay2   payload "on" | "off"   -> GPIO 26
+ *        /<MACID>/relay3   payload "on" | "off"   -> GPIO 27
+ *        /<MACID>/relay4   payload "on" | "off"   -> GPIO 32
+ *      Payload matching is case-insensitive ("ON", "On", "on" all work).
+ *      The relay state is set immediately inside mqtt_message_callback()
+ *      with gpio_set_level() -- no queue hop needed since the GPIO driver
+ *      is thread-safe and the operation is atomic.
  *
  * CHANGES vs v1.3:
  *  [7] MAC-derived node ID
@@ -16,6 +29,10 @@
  *        lwt_topic       /AABBCCA1B2C3/status
  *        health_topic    /AABBCCA1B2C3/health
  *        text_cmd_topic  /AABBCCA1B2C3/text
+ *        relay1_topic    /AABBCCA1B2C3/relay1
+ *        relay2_topic    /AABBCCA1B2C3/relay2
+ *        relay3_topic    /AABBCCA1B2C3/relay3
+ *        relay4_topic    /AABBCCA1B2C3/relay4
  *
  * CHANGES retained from v1.3:
  *  [5] Last-Will-and-Testament (LWT)
@@ -43,10 +60,47 @@
 #include "esp_timer.h"
 #include "esp_netif.h"
 #include "esp_mac.h"      /* [7] esp_read_mac(), ESP_MAC_ETH */
+#include "driver/gpio.h"  /* [8] relay GPIO control */
 #include <string.h>
 #include <stdio.h>
+#include <ctype.h>        /* [8] tolower() for case-insensitive payload */
 
 static const char *TAG = "mqtt-service";
+
+/* -------------------------------------------------------------------------
+ * [8] Relay GPIO map
+ * ------------------------------------------------------------------------- */
+#define RELAY_COUNT  4
+
+static const struct {
+    const char *name;   /* suffix used in topic, e.g. "relay1" */
+    gpio_num_t  gpio;
+} s_relays[RELAY_COUNT] = {
+    { "relay1", GPIO_NUM_23 },
+    { "relay2", GPIO_NUM_26 },
+    { "relay3", GPIO_NUM_27 },
+    { "relay4", GPIO_NUM_32 },
+};
+
+/** Configure all relay GPIOs as push-pull outputs, default LOW (off). */
+static void relay_gpio_init(void)
+{
+    gpio_config_t cfg = {
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+        .pin_bit_mask = (1ULL << GPIO_NUM_23) |
+                        (1ULL << GPIO_NUM_26) |
+                        (1ULL << GPIO_NUM_27) |
+                        (1ULL << GPIO_NUM_32),
+    };
+    gpio_config(&cfg);
+    for (int i = 0; i < RELAY_COUNT; i++) {
+        gpio_set_level(s_relays[i].gpio, 0);
+    }
+    ESP_LOGI(TAG, "Relay GPIOs initialised (23,26,27,32) -- all OFF");  /* [8] */
+}
 
 /* -------------------------------------------------------------------------
  * [7] MAC-derived node ID
@@ -270,6 +324,9 @@ static void mqtt_service_task(void *arg)
         return;
     }
 
+    /* [8] Configure relay output GPIOs before anything else */
+    relay_gpio_init();
+
     /* [7] Derive MAC-based node ID before building any topic strings */
     mqtt_derive_node_id();
 
@@ -478,6 +535,32 @@ static void mqtt_message_callback(const char *topic, const char *data, void *ctx
         display_service_set_text(data);
     }
 
+    /* [8] Relay control: /<MACID>/relay{1..4}  payload: "on" | "off" */
+    for (int i = 0; i < RELAY_COUNT; i++) {
+        char relay_topic[48];
+        snprintf(relay_topic, sizeof(relay_topic),
+                 "%s/%s/%s", CONFIG_MQTT_TOPIC_ROOT, s_mac_id,
+                 s_relays[i].name);
+        if (strcmp(topic, relay_topic) == 0) {
+            /* Case-insensitive compare: copy payload and lowercase it */
+            char cmd[8] = {0};
+            strncpy(cmd, data, sizeof(cmd) - 1);
+            for (int j = 0; cmd[j]; j++) cmd[j] = (char)tolower((unsigned char)cmd[j]);
+
+            if (strcmp(cmd, "on") == 0) {
+                gpio_set_level(s_relays[i].gpio, 1);
+                ESP_LOGI(TAG, "Relay %s ON  (GPIO%d)", s_relays[i].name, s_relays[i].gpio);
+            } else if (strcmp(cmd, "off") == 0) {
+                gpio_set_level(s_relays[i].gpio, 0);
+                ESP_LOGI(TAG, "Relay %s OFF (GPIO%d)", s_relays[i].name, s_relays[i].gpio);
+            } else {
+                ESP_LOGW(TAG, "Relay %s: unknown payload '%s' (expected on/off)",
+                         s_relays[i].name, data);
+            }
+            break;  /* topic matched -- no need to check remaining relays */
+        }
+    }
+
     mqtt_service_message_t msg = { .type = MQTT_SERVICE_EVENT_MESSAGE_RECEIVED };
     strncpy(msg.data.message.topic, topic, sizeof(msg.data.message.topic) - 1);
     strncpy(msg.data.message.data,  data,  sizeof(msg.data.message.data)  - 1);
@@ -504,6 +587,16 @@ static void mqtt_connection_callback(bool connected, void *ctx)
         snprintf(text_topic, sizeof(text_topic),
                  "%s/%s/text", CONFIG_MQTT_TOPIC_ROOT, s_mac_id);
         mqtt_client_subscribe(text_topic, 0);          /* [display] text zone      */
+
+        /* [8] Subscribe to relay command topics: /<MACID>/relay{1..4} */
+        for (int i = 0; i < RELAY_COUNT; i++) {
+            char relay_topic[48];
+            snprintf(relay_topic, sizeof(relay_topic),
+                     "%s/%s/%s", CONFIG_MQTT_TOPIC_ROOT, s_mac_id,
+                     s_relays[i].name);
+            mqtt_client_subscribe(relay_topic, 0);
+            ESP_LOGI(TAG, "Subscribed: %s -> GPIO%d", relay_topic, s_relays[i].gpio);
+        }
 
         /* [5] Publish "online" retained to status topic */
         char status_topic[80];

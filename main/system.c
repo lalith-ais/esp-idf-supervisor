@@ -258,7 +258,7 @@ void ds18b20_temp_supervisor(void *arg)
             uint32_t current_count = ds18b20_temp_service_get_message_count();
             if (current_count == last_message_count) {
                 stale_seconds++;
-                if (stale_seconds > 10) {
+                if (stale_seconds > 60) {
                     ESP_LOGW(TAG, "No new temperature data for %"PRIu32" s", stale_seconds);
                 }
             } else {

@@ -51,7 +51,7 @@ extern char s_mac_id[];
 #define MQTT_TOPIC_ROOT  ""
 
 /* Seconds without a successful reading before is_healthy() returns false */
-#define HEALTH_STALE_S   30
+#define HEALTH_STALE_S   120
 
 /* -------------------------------------------------------------------------
  * Service context
@@ -235,7 +235,7 @@ static void ds18b20_temp_task(void *arg)
         /* Pet heartbeat so supervisor can detect if we get stuck */
         supervisor_heartbeat("ds18b20-temp");
 
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        vTaskDelay(pdMS_TO_TICKS(30000));
     }
 
     ESP_LOGI(TAG, "Task stopping");

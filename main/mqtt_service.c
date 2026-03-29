@@ -1,5 +1,10 @@
 /*
- * mqtt_service.c  (v1.5 -- relay GPIO control)
+ * mqtt_service.c  (v1.6 -- MAC address wait fix)
+ *
+ * CHANGES vs v1.5:
+ *  [9] Fixed MAC address reading - now waits for valid MAC (not all zeros)
+ *      before deriving node ID. Previously would get zeros if Ethernet
+ *      wasn't fully initialized when mqtt_service_task() started.
  *
  * CHANGES vs v1.4:
  *  [8] Four relay outputs driven directly from the MQTT callback (atomic).
@@ -47,7 +52,7 @@
 
 #include "mqtt_service.h"
 #include "app_mqtt.h"
-#include "ethernet_service.h"
+#include "network_service.h"    /* replaces ethernet_service.h */
 #include "supervisor.h"
 #include "priorities.h"
 #include "display_service.h"
@@ -59,11 +64,10 @@
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "esp_netif.h"
-#include "esp_mac.h"      /* [7] esp_read_mac(), ESP_MAC_ETH */
-#include "driver/gpio.h"  /* [8] relay GPIO control */
+#include "driver/gpio.h"        /* [8] relay GPIO control */
 #include <string.h>
 #include <stdio.h>
-#include <ctype.h>        /* [8] tolower() for case-insensitive payload */
+#include <ctype.h>              /* [8] tolower() for case-insensitive payload */
 
 static const char *TAG = "mqtt-service";
 
@@ -99,7 +103,7 @@ static void relay_gpio_init(void)
     for (int i = 0; i < RELAY_COUNT; i++) {
         gpio_set_level(s_relays[i].gpio, 0);
     }
-    ESP_LOGI(TAG, "Relay GPIOs initialised (23,26,27,32) -- all OFF");  /* [8] */
+    ESP_LOGI(TAG, "Relay GPIOs initialised (23,26,27,32) -- all OFF");
 }
 
 /* -------------------------------------------------------------------------
@@ -115,15 +119,61 @@ static void relay_gpio_init(void)
  * ------------------------------------------------------------------------- */
 char s_mac_id[13] = "000000000000";   /* 12 upper-hex digits + NUL  [7] */
 
+/* [9] Helper: check if MAC is valid (not all zeros) */
+static bool is_mac_valid(const uint8_t *mac)
+{
+    for (int i = 0; i < 6; i++) {
+        if (mac[i] != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* [9] Wait for valid MAC address from network_service */
+static esp_err_t mqtt_wait_for_valid_mac(uint8_t *mac, uint32_t timeout_ms)
+{
+    const uint32_t CHECK_INTERVAL_MS = 100;
+    uint32_t elapsed_ms = 0;
+    
+    ESP_LOGI(TAG, "Waiting for valid MAC address (timeout=%d ms)...", timeout_ms);
+    
+    while (elapsed_ms < timeout_ms) {
+        if (network_service_get_mac(mac) == ESP_OK && is_mac_valid(mac)) {
+            ESP_LOGI(TAG, "Valid MAC address obtained: %02X:%02X:%02X:%02X:%02X:%02X",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            return ESP_OK;
+        }
+        
+        supervisor_heartbeat("mqtt");  /* [3] Pet heartbeat while waiting */
+        vTaskDelay(pdMS_TO_TICKS(CHECK_INTERVAL_MS));
+        elapsed_ms += CHECK_INTERVAL_MS;
+    }
+    
+    ESP_LOGE(TAG, "Failed to get valid MAC address after %d ms", timeout_ms);
+    return ESP_ERR_TIMEOUT;
+}
+
 static void mqtt_derive_node_id(void)
 {
     uint8_t mac[6];
-    if (esp_read_mac(mac, ESP_MAC_ETH) == ESP_OK) {
-        snprintf(s_mac_id, sizeof(s_mac_id),
-                 "%02X%02X%02X%02X%02X%02X",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    
+    /* [9] This function now assumes MAC is already valid when called */
+    if (network_service_get_mac(mac) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read MAC, using fallback ID");
+        return;
     }
-    ESP_LOGI(TAG, "Node MAC ID: %s", s_mac_id);  /* [7] */
+    
+    if (!is_mac_valid(mac)) {
+        ESP_LOGW(TAG, "MAC is all zeros, keeping existing node ID");
+        return;
+    }
+    
+    snprintf(s_mac_id, sizeof(s_mac_id),
+             "%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    
+    ESP_LOGI(TAG, "Node MAC ID: %s", s_mac_id);
 }
 
 /* -------------------------------------------------------------------------
@@ -133,8 +183,7 @@ static void mqtt_derive_node_id(void)
 #warning "CONFIG_MQTT_BROKER_URI not set in sdkconfig -- using compile-time fallback"
 #define CONFIG_MQTT_BROKER_URI "mqtt://192.168.1.1"
 #endif
-/* [7] client_id and topics are built at runtime from the MAC; only the      */
-/*     prefix/root strings are kept as compile-time constants.               */
+
 #ifndef CONFIG_MQTT_CLIENT_ID_PREFIX
 #define CONFIG_MQTT_CLIENT_ID_PREFIX    ""
 #endif
@@ -201,7 +250,7 @@ static void cleanup_and_exit(esp_err_t err_code, const char *err_msg,
     strncpy(msg.data.error.error_msg, err_msg,
             sizeof(msg.data.error.error_msg) - 1);
 
-    queue_send_warn(s_ctx.event_queue, &msg, "ERROR");  /* [1] */
+    queue_send_warn(s_ctx.event_queue, &msg, "ERROR");
 
     if (s_ctx.event_queue != NULL) {
         vQueueDelete(s_ctx.event_queue);
@@ -243,7 +292,7 @@ static void mqtt_publish_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
-        if (!ethernet_service_has_ip()) {
+        if (!network_service_has_ip()) {
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
         }
@@ -253,12 +302,11 @@ static void mqtt_publish_task(void *arg)
         int64_t uptime_s = (esp_timer_get_time() - boot_us) / 1000000LL;
         uint32_t heap    = esp_get_free_heap_size();
 
-        /* Get IP as string */
+        /* Get IP via network_service -- transport-agnostic, no netif key needed */
         char ip_str[16] = "0.0.0.0";
-        esp_netif_ip_info_t ip_info;
-        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("ETH_DEF");
-        if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
-            snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
+        const char *ip_p = network_service_get_ip();
+        if (ip_p && ip_p[0]) {
+            strncpy(ip_str, ip_p, sizeof(ip_str) - 1);
         }
 
         /* Optional crash key */
@@ -287,7 +335,7 @@ static void mqtt_publish_task(void *arg)
             };
             strncpy(pub.data.published.topic, health_topic,
                     sizeof(pub.data.published.topic) - 1);
-            queue_send_warn(s_ctx.event_queue, &pub, "HEALTH");  /* [1] */
+            queue_send_warn(s_ctx.event_queue, &pub, "HEALTH");
             ESP_LOGI(TAG, "Health: %s", payload);
         } else {
             ESP_LOGW(TAG, "Health publish failed");
@@ -298,6 +346,28 @@ static void mqtt_publish_task(void *arg)
 
     ESP_LOGI(TAG, "Health publish task stopping");
     vTaskDelete(NULL);
+}
+
+/* -------------------------------------------------------------------------
+ * [9] Rebuild MQTT topics after MAC is known
+ * ------------------------------------------------------------------------- */
+static void mqtt_rebuild_topics(void)
+{
+    /* Rebuild client_id */
+    snprintf(s_ctx.config.client_id, sizeof(s_ctx.config.client_id),
+             "%s%s", CONFIG_MQTT_CLIENT_ID_PREFIX, s_mac_id);
+
+    /* Rebuild publish_topic */
+    snprintf(s_ctx.config.publish_topic, sizeof(s_ctx.config.publish_topic),
+             "%s/%s", CONFIG_MQTT_TOPIC_ROOT, s_mac_id);
+
+    /* Rebuild subscribe_topic */
+    snprintf(s_ctx.config.subscribe_topic, sizeof(s_ctx.config.subscribe_topic),
+             "%s/%s/cmd", CONFIG_MQTT_TOPIC_ROOT, s_mac_id);
+    
+    ESP_LOGI(TAG, "Topics rebuilt: client=%s, pub=%s, sub=%s",
+             s_ctx.config.client_id, s_ctx.config.publish_topic,
+             s_ctx.config.subscribe_topic);
 }
 
 /* -------------------------------------------------------------------------
@@ -327,7 +397,16 @@ static void mqtt_service_task(void *arg)
     /* [8] Configure relay output GPIOs before anything else */
     relay_gpio_init();
 
-    /* [7] Derive MAC-based node ID before building any topic strings */
+    /* [9] WAIT FOR VALID MAC ADDRESS BEFORE PROCEEDING */
+    uint8_t mac[6];
+    esp_err_t mac_err = mqtt_wait_for_valid_mac(mac, 10000); /* 10 second timeout */
+    if (mac_err != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot start MQTT service without valid MAC address");
+        cleanup_and_exit(mac_err, "MAC address timeout", false);
+        return;
+    }
+
+    /* [7] Derive MAC-based node ID (now guaranteed valid) */
     mqtt_derive_node_id();
 
     /* Apply defaults from sdkconfig if not overridden by caller */
@@ -335,21 +414,12 @@ static void mqtt_service_task(void *arg)
         strncpy(s_ctx.config.broker_uri, CONFIG_MQTT_BROKER_URI,
                 sizeof(s_ctx.config.broker_uri) - 1);
 
-        /* client_id  ->  "AABBCCA1B2C3"  [7] */
-        snprintf(s_ctx.config.client_id, sizeof(s_ctx.config.client_id),
-                 "%s%s", CONFIG_MQTT_CLIENT_ID_PREFIX, s_mac_id);
-
-        /* publish_topic  ->  "/AABBCCA1B2C3"  [7] */
-        snprintf(s_ctx.config.publish_topic, sizeof(s_ctx.config.publish_topic),
-                 "%s/%s", CONFIG_MQTT_TOPIC_ROOT, s_mac_id);
-
-        /* subscribe_topic  ->  "/AABBCCA1B2C3/cmd"  [7] */
-        snprintf(s_ctx.config.subscribe_topic, sizeof(s_ctx.config.subscribe_topic),
-                 "%s/%s/cmd", CONFIG_MQTT_TOPIC_ROOT, s_mac_id);
+        /* Build all topics using the valid MAC ID */
+        mqtt_rebuild_topics();
 
         s_ctx.config.enabled             = true;
         s_ctx.config.publish_interval_ms = CONFIG_MQTT_PUBLISH_INTERVAL_MS;
-        s_ctx.config.health_interval_ms  = CONFIG_MQTT_HEALTH_INTERVAL_MS;  /* [6] */
+        s_ctx.config.health_interval_ms  = CONFIG_MQTT_HEALTH_INTERVAL_MS;
     }
 
     /* Build LWT topic: <publish_topic>/status */
@@ -364,7 +434,7 @@ static void mqtt_service_task(void *arg)
         const uint32_t STEP_MS  = 500;
         uint32_t waited = 0;
 
-        while (!ethernet_service_has_ip() && s_ctx.is_running) {
+        while (!network_service_has_ip() && s_ctx.is_running) {
 #ifdef CONFIG_ESP_TASK_WDT
             esp_task_wdt_reset();
 #endif
@@ -418,7 +488,7 @@ static void mqtt_service_task(void *arg)
 
     {
         mqtt_service_message_t started = { .type = MQTT_SERVICE_EVENT_STARTED };
-        queue_send_warn(s_ctx.event_queue, &started, "STARTED");  /* [1] */
+        queue_send_warn(s_ctx.event_queue, &started, "STARTED");
     }
 
     /* Spawn publish task */
@@ -444,17 +514,17 @@ static void mqtt_service_task(void *arg)
             queue_send_warn(s_ctx.event_queue, &msg, "requeue");
         }
 
-        if (!ethernet_service_has_ip()) {
+        if (!network_service_has_ip()) {
             ESP_LOGW(TAG, "Lost Ethernet IP -- stopping MQTT client");
             mqtt_client_stop();
             s_ctx.is_connected = false;
 
             uint32_t wait_ms = 0;
-            while (!ethernet_service_has_ip() && s_ctx.is_running) {
+            while (!network_service_has_ip() && s_ctx.is_running) {
 #ifdef CONFIG_ESP_TASK_WDT
                 esp_task_wdt_reset();
 #endif
-                supervisor_heartbeat("mqtt");  /* [3] */
+                supervisor_heartbeat("mqtt");
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 wait_ms += 1000;
                 if (wait_ms >= 30000) {
@@ -463,7 +533,7 @@ static void mqtt_service_task(void *arg)
                     break;
                 }
             }
-            if (s_ctx.is_running && ethernet_service_has_ip()) {
+            if (s_ctx.is_running && network_service_has_ip()) {
                 ESP_LOGI(TAG, "Ethernet restored -- restarting MQTT");
                 mqtt_client_start();
             }
@@ -493,7 +563,7 @@ static void mqtt_service_task(void *arg)
 
     {
         mqtt_service_message_t stopped = { .type = MQTT_SERVICE_EVENT_STOPPED };
-        queue_send_warn(s_ctx.event_queue, &stopped, "STOPPED");  /* [1] */
+        queue_send_warn(s_ctx.event_queue, &stopped, "STOPPED");
     }
 
     if (s_ctx.event_queue != NULL) {
@@ -564,7 +634,7 @@ static void mqtt_message_callback(const char *topic, const char *data, void *ctx
     mqtt_service_message_t msg = { .type = MQTT_SERVICE_EVENT_MESSAGE_RECEIVED };
     strncpy(msg.data.message.topic, topic, sizeof(msg.data.message.topic) - 1);
     strncpy(msg.data.message.data,  data,  sizeof(msg.data.message.data)  - 1);
-    queue_send_warn(s_ctx.event_queue, &msg, "MSG_RECEIVED");  /* [1] */
+    queue_send_warn(s_ctx.event_queue, &msg, "MSG_RECEIVED");
     s_ctx.message_counter++;
 }
 
@@ -610,7 +680,7 @@ static void mqtt_connection_callback(bool connected, void *ctx)
         display_service_set_mqtt_connected(false);   /* show ---- on display */
     }
 
-    queue_send_warn(s_ctx.event_queue, &msg,  /* [1] */
+    queue_send_warn(s_ctx.event_queue, &msg,
                     connected ? "CONNECTED" : "DISCONNECTED");
 }
 
@@ -641,7 +711,7 @@ QueueHandle_t mqtt_service_get_queue(void)    { return s_ctx.event_queue;  }
 bool mqtt_service_is_connected(void)           { return s_ctx.is_connected; }
 bool mqtt_service_is_running(void)             { return s_ctx.is_running;   }
 bool mqtt_service_can_publish(void) {
-    return s_ctx.is_running && s_ctx.is_connected && ethernet_service_has_ip();
+    return s_ctx.is_running && s_ctx.is_connected && network_service_has_ip();
 }
 
 void mqtt_service_set_config(const mqtt_config_t *c) {

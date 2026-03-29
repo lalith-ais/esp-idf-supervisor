@@ -1,21 +1,16 @@
 /*
  * system.h - Service registry and supervisor task declarations
  *
- * FIXES vs original:
- *   - All function *definitions* (ethernet_supervisor, mqtt_supervisor,
- *     ds18b20_temp_supervisor) moved to system.c.  Only forward declarations
- *     remain here → including this header from multiple TUs is safe.
- *   - services[] array definition moved to system.c (declared extern here).
- *   - Unused / broken DEFINE_SERVICE_SUPERVISOR macro removed.
- *   - Priority values now come from priorities.h instead of magic numbers.
- *   - Typos in comments fixed.
+ * CHANGES vs previous version:
+ *  [NET] ethernet_supervisor renamed network_supervisor.
+ *  [NET] ethernet_service.h include removed; consumers use network_service.h.
  */
 
 #ifndef SYSTEM_H
 #define SYSTEM_H
 
 #include "supervisor.h"
-#include "ethernet_service.h"
+#include "network_service.h"    /* replaces ethernet_service.h */
 #include "mqtt_service.h"
 #include "ds18b20_temp.h"
 #include "display_service.h"
@@ -25,7 +20,7 @@ extern "C" {
 #endif
 
 /* Supervisor task entry points (defined in system.c) */
-void ethernet_supervisor(void *arg);
+void network_supervisor(void *arg);     /* was ethernet_supervisor */
 void mqtt_supervisor(void *arg);
 void ds18b20_temp_supervisor(void *arg);
 void display_supervisor(void *arg);

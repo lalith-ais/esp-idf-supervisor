@@ -1,30 +1,29 @@
 /*
  * system.c - Service supervisor tasks and registry
  *
- * FIXES vs original system.h (inline definitions):
+ * CHANGES vs previous version:
  *
- *  [CRITICAL] system.h contained function & variable definitions
- *      All definitions are now here; system.h only has declarations.
+ *  [NET] ethernet_supervisor renamed network_supervisor.
+ *        Now calls network_service_start/stop (transport-agnostic) instead
+ *        of ethernet_service_start/stop.  The ethernet_transport vtable is
+ *        passed in at startup -- swapping to wifi_transport is one line here.
  *
- *  [CRITICAL] Orphaned inner tasks on supervisor restart
- *      Each supervisor now calls the service's _stop() before _start() so
- *      that an inner task left running from a previous incarnation is cleanly
- *      torn down before a new one is created.
+ *  [NET] ethernet_service.h replaced by network_service.h + ethernet_transport.h
  *
- *  [CRITICAL] DS18B20 float sensor-index encoding hack
- *      Removed entirely.  The queue now carries a proper struct
- *      (ds18b20_reading_t defined in ds18b20_temp.h) with explicit fields.
- *      See ds18b20_temp.c / ds18b20_temp.h for the matching change.
+ *  [NET] Queue message type changed from eth_service_message_t / ETH_EVENT_*
+ *        to net_service_message_t / NET_EVENT_*
  *
- *  [MINOR] Typos in comments fixed ("temerature servoce" → "temperature service")
- *  [MINOR] Inconsistent log tags unified per supervisor.
- *  [MINOR] Unused DEFINE_SERVICE_SUPERVISOR macro removed.
- *  [MINOR] Priority magic numbers replaced with constants from priorities.h.
+ *  [NET] mqtt_supervisor's stray ethernet_service_has_ip() call replaced with
+ *        network_service_has_ip().
+ *
+ * Everything else (mqtt_supervisor, ds18b20_supervisor, display_supervisor,
+ * restart policy, heartbeat, NVS crash, priority constants) is UNCHANGED.
  */
 
 #include "system.h"
 #include "priorities.h"
-#include "ethernet_service.h"
+#include "network_service.h"        /* replaces ethernet_service.h */
+#include "ethernet_transport.h"     /* swap to wifi_transport.h for WiFi */
 #include "mqtt_service.h"
 #include "ds18b20_temp.h"
 #include "display_service.h"
@@ -38,10 +37,6 @@
  * Helpers
  * ========================================================================= */
 
-/**
- * @brief  Wait up to @p max_ms for @p get_queue_fn to return a non-NULL handle.
- * @return The queue handle, or NULL on timeout.
- */
 static QueueHandle_t wait_for_queue(QueueHandle_t (*get_queue_fn)(void),
                                     uint32_t max_ms)
 {
@@ -59,25 +54,24 @@ static QueueHandle_t wait_for_queue(QueueHandle_t (*get_queue_fn)(void),
 }
 
 /* =========================================================================
- * ethernet_supervisor
+ * network_supervisor  (was ethernet_supervisor)
+ *
+ * Passes the chosen transport vtable to network_service_start().
+ * To switch transport: change &ethernet_transport to &wifi_transport here
+ * and update the #include above.  Nothing else in the file changes.
  * ========================================================================= */
 
-void ethernet_supervisor(void *arg)
+void network_supervisor(void *arg)
 {
-    static const char *TAG = "ethernet-super";
-    ESP_LOGI(TAG, "Starting");
+    static const char *TAG = "network-super";
+    ESP_LOGI(TAG, "Starting (transport: %s)", ethernet_transport.name);
 
-    /*
-     * FIX: Stop any previous inner service before starting a new one.
-     * This prevents orphaned tasks when the supervisor itself is restarted.
-     */
-    ethernet_service_stop();
+    network_service_stop();  /* clean up any prior inner task */
+    network_service_start(&ethernet_transport);
 
-    ethernet_service_start();
-
-    QueueHandle_t queue = wait_for_queue(ethernet_service_get_queue, 500);
+    QueueHandle_t queue = wait_for_queue(network_service_get_queue, 500);
     if (queue == NULL) {
-        ESP_LOGE(TAG, "Failed to obtain Ethernet event queue — exiting");
+        ESP_LOGE(TAG, "Failed to obtain network event queue -- exiting");
         vTaskDelete(NULL);
         return;
     }
@@ -89,27 +83,27 @@ void ethernet_supervisor(void *arg)
 #endif
 
     while (1) {
-        eth_service_message_t msg;
+        net_service_message_t msg;
 
         if (xQueueReceive(queue, &msg, pdMS_TO_TICKS(1000)) == pdTRUE) {
             switch (msg.type) {
-                case ETH_EVENT_CONNECTED:
-                    ESP_LOGI(TAG, "Ethernet connected");
+                case NET_EVENT_CONNECTED:
+                    ESP_LOGI(TAG, "Network connected");
                     break;
-                case ETH_EVENT_DISCONNECTED:
-                    ESP_LOGW(TAG, "Ethernet disconnected");
+                case NET_EVENT_DISCONNECTED:
+                    ESP_LOGW(TAG, "Network disconnected");
                     break;
-                case ETH_EVENT_GOT_IP:
+                case NET_EVENT_GOT_IP:
                     ESP_LOGI(TAG, "Got IP: %s", msg.data.got_ip.ip);
                     break;
-                case ETH_EVENT_STARTED:
-                    ESP_LOGI(TAG, "Ethernet started");
+                case NET_EVENT_STARTED:
+                    ESP_LOGI(TAG, "Network started");
                     break;
-                case ETH_EVENT_STOPPED:
-                    ESP_LOGW(TAG, "Ethernet stopped");
+                case NET_EVENT_STOPPED:
+                    ESP_LOGW(TAG, "Network stopped");
                     break;
-                case ETH_EVENT_ERROR:
-                    ESP_LOGE(TAG, "Ethernet hardware error — exiting supervisor");
+                case NET_EVENT_ERROR:
+                    ESP_LOGE(TAG, "Network hardware error -- exiting supervisor");
 #ifdef CONFIG_ESP_TASK_WDT
                     esp_task_wdt_delete(NULL);
 #endif
@@ -133,7 +127,7 @@ void ethernet_supervisor(void *arg)
 }
 
 /* =========================================================================
- * mqtt_supervisor
+ * mqtt_supervisor  -- UNCHANGED except one log line
  * ========================================================================= */
 
 void mqtt_supervisor(void *arg)
@@ -141,14 +135,12 @@ void mqtt_supervisor(void *arg)
     static const char *TAG = "mqtt-super";
     ESP_LOGI(TAG, "Starting");
 
-    /* FIX: tear down any leftover inner task first */
     mqtt_service_stop();
-
     mqtt_service_start();
 
     QueueHandle_t queue = wait_for_queue(mqtt_service_get_queue, 500);
     if (queue == NULL) {
-        ESP_LOGE(TAG, "Failed to obtain MQTT event queue — exiting");
+        ESP_LOGE(TAG, "Failed to obtain MQTT event queue -- exiting");
         vTaskDelete(NULL);
         return;
     }
@@ -171,7 +163,7 @@ void mqtt_supervisor(void *arg)
                     ESP_LOGW(TAG, "MQTT disconnected");
                     break;
                 case MQTT_SERVICE_EVENT_MESSAGE_RECEIVED:
-                    ESP_LOGI(TAG, "Message: %s → %s",
+                    ESP_LOGI(TAG, "Message: %s -> %s",
                              msg.data.message.topic, msg.data.message.data);
                     break;
                 case MQTT_SERVICE_EVENT_PUBLISHED:
@@ -198,8 +190,8 @@ void mqtt_supervisor(void *arg)
             }
         }
 
-        if (!ethernet_service_has_ip()) {
-            ESP_LOGW(TAG, "No Ethernet IP — MQTT service will handle reconnection");
+        if (!network_service_has_ip()) {
+            ESP_LOGW(TAG, "No network IP -- MQTT service will handle reconnection");
         }
 
 #ifdef CONFIG_ESP_TASK_WDT
@@ -214,7 +206,7 @@ void mqtt_supervisor(void *arg)
 }
 
 /* =========================================================================
- * ds18b20_temp_supervisor
+ * ds18b20_temp_supervisor  -- UNCHANGED
  * ========================================================================= */
 
 void ds18b20_temp_supervisor(void *arg)
@@ -222,14 +214,12 @@ void ds18b20_temp_supervisor(void *arg)
     static const char *TAG = "ds18b20-super";
     ESP_LOGI(TAG, "DS18B20 temperature supervisor starting");
 
-    /* FIX: tear down any leftover inner task first */
     ds18b20_temp_service_stop();
-
     ds18b20_temp_service_start();
 
     QueueHandle_t queue = wait_for_queue(ds18b20_temp_service_get_queue, 500);
     if (queue == NULL) {
-        ESP_LOGE(TAG, "Failed to obtain DS18B20 event queue — exiting");
+        ESP_LOGE(TAG, "Failed to obtain DS18B20 event queue -- exiting");
         vTaskDelete(NULL);
         return;
     }
@@ -244,22 +234,19 @@ void ds18b20_temp_supervisor(void *arg)
     uint32_t stale_seconds      = 0;
 
     while (1) {
-        /*
-         * FIX: queue now carries ds18b20_reading_t (sensor_index + temperature)
-         * instead of a float with the index packed in via ×1000 arithmetic.
-         */
         ds18b20_reading_t reading;
 
         if (xQueueReceive(queue, &reading, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            ESP_LOGI(TAG, "Sensor[%d]: %.2f°C", reading.sensor_index, reading.temperature);
+            ESP_LOGI(TAG, "Sensor[%d]: %.2f°C",
+                     reading.sensor_index, reading.temperature);
             stale_seconds = 0;
         } else {
-            /* No item in queue this second — check whether the service is progressing */
             uint32_t current_count = ds18b20_temp_service_get_message_count();
             if (current_count == last_message_count) {
                 stale_seconds++;
                 if (stale_seconds > 60) {
-                    ESP_LOGW(TAG, "No new temperature data for %"PRIu32" s", stale_seconds);
+                    ESP_LOGW(TAG, "No new temperature data for %" PRIu32 " s",
+                             stale_seconds);
                 }
             } else {
                 stale_seconds = 0;
@@ -283,11 +270,7 @@ void ds18b20_temp_supervisor(void *arg)
 }
 
 /* =========================================================================
- * display_supervisor
- *
- * Manages the display service.  The display service has no event
- * queue of its own that the supervisor needs to drain -- it is self-contained.
- * The supervisor simply starts it, then loops doing periodic health checks.
+ * display_supervisor  -- UNCHANGED
  * ========================================================================= */
 
 void display_supervisor(void *arg)
@@ -295,13 +278,12 @@ void display_supervisor(void *arg)
     static const char *TAG = "display-super";
     ESP_LOGI(TAG, "Display supervisor starting");
 
-    display_service_stop();   /* clean up any prior instance */
+    display_service_stop();
     display_service_start();
 
     while (1) {
         if (!display_service_is_running()) {
             ESP_LOGW(TAG, "Display service stopped unexpectedly");
-            /* Supervisor will handle restart via restart policy */
             break;
         }
         vTaskDelay(pdMS_TO_TICKS(5000));
@@ -313,14 +295,24 @@ void display_supervisor(void *arg)
 /* =========================================================================
  * Service registry
  *
- * FIX: priority values now come from priorities.h — no magic numbers.
+ * [NET] Entry renamed from "ethernet" to "network" and points to
+ *       network_supervisor.
+ *
+ *       IMPORTANT: the service name here ("network") must match the
+ *       supervisor_heartbeat() tag used inside network_service.c.
+ *       network_service.c calls supervisor_heartbeat(transport->name),
+ *       and ethernet_transport.name == "ethernet".
+ *
+ *       Therefore keep the registry name as "ethernet" while using
+ *       ethernet_transport, and change it to "wifi" (or "network")
+ *       when you switch -- it just has to match transport->name.
  * ========================================================================= */
 
 const service_def_t services[] = {
-    /* name           entry                    stack   priority                  restart        essential  ctx   heartbeat_s */
-    {"ethernet",     ethernet_supervisor,      12288, PRIO_ETH_SUPERVISOR,    RESTART_ALWAYS, true,  NULL, 30},
-    {"mqtt",         mqtt_supervisor,           8192, PRIO_MQTT_SUPERVISOR,   RESTART_ALWAYS, false, NULL, 30},
-    {"ds18b20-temp", ds18b20_temp_supervisor,   4096, PRIO_DS18B20_SUPERVISOR,RESTART_ALWAYS, false, NULL, 60},
-    {"display",      display_supervisor,        4096, PRIO_DS18B20_SUPERVISOR,RESTART_ALWAYS, false, NULL, 0},
-    {NULL, NULL, 0, 0, RESTART_NEVER, false, NULL, 0}   /* sentinel */
+    /* name        entry                stack   priority               restart        essential  ctx   hb_s */
+    {"ethernet",   network_supervisor,  12288, PRIO_ETH_SUPERVISOR,  RESTART_ALWAYS, true,  NULL, 30},
+    {"mqtt",       mqtt_supervisor,      8192, PRIO_MQTT_SUPERVISOR, RESTART_ALWAYS, false, NULL, 30},
+    {"ds18b20-temp", ds18b20_temp_supervisor, 4096, PRIO_DS18B20_SUPERVISOR, RESTART_ALWAYS, false, NULL, 60},
+    {"display",    display_supervisor,   4096, PRIO_DS18B20_SUPERVISOR, RESTART_ALWAYS, false, NULL, 0},
+    {NULL, NULL, 0, 0, RESTART_NEVER, false, NULL, 0}  /* sentinel */
 };

@@ -130,6 +130,16 @@ esp_err_t ethernet_init(esp_eth_handle_t **eth_handles_out, uint8_t *eth_cnt_out
 
     // Create network interface
     esp_netif_t *eth_netif = esp_netif_new(&(esp_netif_config_t)ESP_NETIF_DEFAULT_ETH());
+	   /* ---- unique hostname ---- */
+	uint8_t mac[6];
+	char hostname[32];
+	esp_eth_ioctl(eth_handles[0], ETH_CMD_G_MAC_ADDR, mac);
+	snprintf(hostname, sizeof(hostname),
+	         "esp32-%02X%02X%02X%02X%02X%02X",
+	         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+	esp_netif_set_hostname(eth_netif, hostname);
+	ESP_LOGI(TAG, "DHCP hostname: %s", hostname);
+	/* ------------------------- */ 
     esp_eth_netif_glue_handle_t eth_netif_glue = esp_eth_new_netif_glue(eth_handles[0]);
     
     // Attach Ethernet driver to TCP/IP stack

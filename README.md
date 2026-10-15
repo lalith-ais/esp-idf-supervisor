@@ -1,28 +1,27 @@
-# ESP32-P4 Supervisor
+# ESP32-P4 Supervisor / Control Node
 
-> A FreeRTOS service supervision framework for ESP-IDF v5.x — start, monitor, and automatically restart application tasks, inspired by Unix `init` / `systemd`.
+> A FreeRTOS service supervision framework for ESP-IDF v5.x — start, monitor, and automatically restart application tasks, inspired by Unix `init` / `systemd`. On top of it runs a **MAC-addressed MQTT control node**: temperature telemetry, four MQTT-controlled relay outputs, and a small OLED status display.
 
-Tested on real hardware: **ESP32-P4** with internal Ethernet (IP101 PHY), MQTT broker, DS18B20 temperature sensors and SSD1306 i2c OLED display
+Tested on real hardware: **ESP32-P4** with internal Ethernet (IP101 PHY), MQTT broker, DS18B20 temperature sensors and SSD1306 i2c OLED display.
 
 ---
 
 ## Table of Contents
 
 - [Features](#features)
+- [MQTT Topic Reference](#mqtt-topic-reference)
+- [Relay Control](#relay-control)
 - [Design Philosophy](#design-philosophy)
 - [Architecture](#architecture)
 - [File Structure](#file-structure)
 - [Quick Start](#quick-start)
 - [Task Priority Hierarchy](#task-priority-hierarchy)
 - [Supervisor](#supervisor)
-  - [Configuration Macros](#configuration-macros)
-  - [Restart Policies](#restart-policies)
-  - [Exponential Back-off](#exponential-back-off)
-  - [Public API](#supervisor-public-api)
 - [Services](#services)
-  - [Ethernet Service](#ethernet-service)
+  - [Network Service](#network-service)
   - [MQTT Service](#mqtt-service)
   - [DS18B20 Temperature Service](#ds18b20-temperature-service)
+  - [Display Service](#display-service)
 - [Adding a New Service](#adding-a-new-service)
 - [Build & Configuration](#build--configuration)
 - [Hardware Pin Assignment](#hardware-pin-assignment)
@@ -36,14 +35,75 @@ Tested on real hardware: **ESP32-P4** with internal Ethernet (IP101 PHY), MQTT b
 
 - **Service supervision** — monitors FreeRTOS tasks and restarts them on failure
 - **Configurable restart policies** — `RESTART_NEVER`, `RESTART_ALWAYS`, `RESTART_ON_CRASH`
+- **Heartbeat / stuck-task detection** — optional per-service `heartbeat_timeout_s`
 - **Non-blocking exponential back-off** — failed restarts don't stall the supervisor loop
-- **Essential service support** — triggers `esp_restart()` if a critical service can't recover
+- **Essential service support** — triggers `esp_restart()` if a critical service can't recover; crash reason is persisted in NVS
 - **Two-tier supervision model** — supervisor → wrapper task → inner service task
-- **Ethernet** with event-driven state machine and IP tracking
-- **MQTT** publish/subscribe with automatic reconnection on network loss
-- **DS18B20** 1-Wire temperature sensing with typed event queue
+- **Transport-agnostic networking** — `network_service` sits above a transport vtable (Ethernet today, WiFi possible by swapping one pointer in `system.c`)
+- **MAC-derived node identity** — one binary for every unit; client ID and all topics are built at runtime from the Ethernet MAC (e.g. `30EDA0EA52E4`)
+- **MQTT** publish/subscribe, LWT (`online`/`offline`), periodic health JSON, automatic reconnection on network loss
+- **4 relay outputs** switched by MQTT (`on` / `off`)
+- **DS18B20** 1-Wire temperature sensing, published to MQTT every 30 s
+- **SSD1306 OLED** showing a clock and a two-line text zone, driven over MQTT
 - **Centralised priority definitions** — no magic numbers anywhere
 - **ESP-IDF v5.x compatible**
+
+---
+
+## MQTT Topic Reference
+
+All topics are `<root>/<MAC>/<name>`. `<root>` is `CONFIG_MQTT_TOPIC_ROOT` (default **empty**), so topics start with a single `/`. `<MAC>` is the 12-digit upper-case hex Ethernet MAC with no separators — for example `30EDA0EA52E4`. The MAC is printed at boot as `Node MAC ID: ...`.
+
+| Topic | Direction | Payload | QoS / retain | Notes |
+|-------|-----------|---------|--------------|-------|
+| `/<MAC>/status` | node → broker | `online` / `offline` | 1 / retained | `online` on connect; `offline` is the LWT |
+| `/<MAC>/health` | node → broker | JSON `{"uptime_s":…,"heap_free":…,"ip":"…"}` (plus `"crash"` if the supervisor recorded one) | 1 / no | every 30 s |
+| `/<MAC>/temperature` | node → broker | e.g. `21.25` | 0 / no | used when **one** DS18B20 is found |
+| `/<MAC>/temperature/N` | node → broker | e.g. `16.44` | 0 / no | used when **several** sensors are found; `N` = 0-based index in 1-Wire enumeration order |
+| `/<MAC>/relay1` … `/<MAC>/relay4` | broker → node | `on` / `off` (case-insensitive) | 0 | see [Relay Control](#relay-control) |
+| `/<MAC>/text` | broker → node | any text, max 63 chars | 0 | shown in the OLED text zone |
+| `/<MAC>/cmd` | broker → node | `led_on` / `led_off` / `reboot` | 0 | **log-only stubs, no action** — see [Known Issues](#known-issues--limitations) |
+| `/SYS/time` | broker → node | `HH:MM` | 0 | shared clock for the OLED; not per-unit |
+
+The MQTT client ID is `<CONFIG_MQTT_CLIENT_ID_PREFIX><MAC>` (prefix defaults to empty).
+
+---
+
+## Relay Control
+
+Four relay outputs are driven directly from the MQTT message callback (`mqtt_message_callback()` in `mqtt_service.c`) using `gpio_set_level()` — no queue hop.
+
+| Topic | GPIO |
+|-------|------|
+| `/<MAC>/relay1` | 23 |
+| `/<MAC>/relay2` | 26 |
+| `/<MAC>/relay3` | 27 |
+| `/<MAC>/relay4` | 32 |
+
+Behaviour:
+
+- At start-up all four GPIOs are configured as push-pull outputs and driven **LOW (off)** (`relay_gpio_init()`).
+- The node subscribes to the four relay topics every time the broker connection is (re)established.
+- Payload `on` sets the pin **HIGH**; payload `off` sets it **LOW**. Matching is case-insensitive (`ON`, `On`, `on`). Anything else logs a warning and changes nothing.
+- The logic is **active-high**. If your relay board is active-low, on/off are inverted and all relays will be energised at boot — check before connecting a load.
+- Relay state is **not stored** on the node and **not published back**. After a reboot every relay is off, unless the broker holds a *retained* command, which is applied as soon as the node re-subscribes.
+
+Example (broker `192.168.124.4`, unit `30EDA0EA52E4`):
+
+```bash
+mosquitto_pub -h 192.168.124.4 -t /30EDA0EA52E4/relay1 -m on
+mosquitto_pub -h 192.168.124.4 -t /30EDA0EA52E4/relay1 -m off
+
+# watch everything the unit publishes
+mosquitto_sub -h 192.168.124.4 -t '/30EDA0EA52E4/#' -v
+```
+
+Expected serial log on a command:
+
+```
+I mqtt-service: RX: /30EDA0EA52E4/relay1 -> on
+I mqtt-service: Relay relay1 ON  (GPIO23)
+```
 
 ---
 
@@ -94,51 +154,64 @@ The firmware uses a two-tier supervision hierarchy. A single top-level superviso
 ```
 app_main  (main.c)
   └─ supervisor_start(services)          ← supervisor.c
-        ├─ ethernet_supervisor           ← system.c   [priority 23]
-        │    └─ ethernet_service_task    ← ethernet_service.c   [priority 22]
-        │         └─ ethernet_setup      ← ethernet_setup.c  (HW driver)
+        ├─ network_supervisor            ← system.c   [priority 23]
+        │    └─ network_service_task     ← network_service.c  [priority 22]
+        │         └─ ethernet_transport  ← ethernet_transport.c (transport vtable)
+        │              └─ ethernet_setup ← ethernet_setup.c     (HW driver)
         │
         ├─ mqtt_supervisor               ← system.c   [priority 20]
         │    ├─ mqtt_service_task        ← mqtt_service.c   [priority 19]
-        │    └─ mqtt_publish_task        ← mqtt_service.c   [priority  5]
+        │    │     └─ relay GPIO control (in mqtt_message_callback)
+        │    └─ mqtt_publish_task        ← mqtt_service.c   [priority  5]  (health JSON)
         │         └─ app_mqtt            ← app_mqtt.c  (ESP-IDF MQTT wrapper)
         │
-        └─ ds18b20_temp_supervisor       ← system.c   [priority 10]
-             └─ ds18b20_temp_task        ← ds18b20_temp.c   [priority  5]
-                   └─ 1-Wire RMT bus     (espressif__onewire_bus component)
+        ├─ ds18b20_temp_supervisor       ← system.c   [priority 10]
+        │    └─ ds18b20_temp_task        ← ds18b20_temp.c   [priority  5]
+        │          └─ 1-Wire RMT bus     (espressif__onewire_bus component)
+        │
+        └─ display_supervisor            ← system.c   [priority 10]
+             └─ display_service_task     ← display_service.c [priority 4]
+                   └─ SSD1306 over I2C
 ```
+
+Data flow between services is by function call into thread-safe setters (`display_service_set_text()`, `mqtt_service_publish()`) and by queues for events.
 
 ---
 
 ## File Structure
 
 ```
-esp-idf-supervisor/
+control-node/
 ├── CMakeLists.txt
+├── README.md
 └── main/
     ├── CMakeLists.txt
+    ├── Kconfig.projbuild       # CONFIG_MQTT_BROKER_URI
+    ├── idf_component.yml
     ├── main.c                  # Boot entry point
-    ├── priorities.h            # All FreeRTOS priority constants (single source of truth)
-    ├── supervisor.h            # Public supervisor API + types
-    ├── supervisor.c            # Supervisor implementation
-    ├── system.h                # Service supervisor declarations + extern services[]
-    ├── system.c                # Supervisor task bodies + service registry
-    ├── ethernet_service.h/.c   # Ethernet wrapper — event queue, state, IP tracking
-    ├── ethernet_setup.h/.c     # Low-level ESP-IDF Ethernet driver
-    ├── mqtt_service.h/.c       # MQTT wrapper — broker lifecycle, pub/sub
+    ├── priorities.h            # All FreeRTOS priority constants
+    ├── supervisor.h/.c         # Supervisor API + implementation (heartbeat, NVS crash record)
+    ├── system.h/.c             # Supervisor task bodies + services[] registry
+    ├── network_service.h/.c    # Transport-agnostic network state, MAC + IP accessors
+    ├── network_transport.h     # Transport driver interface (vtable)
+    ├── ethernet_transport.h/.c # Ethernet implementation of the transport vtable
+    ├── ethernet_setup.h/.c     # Low-level ESP-IDF Ethernet driver (IP101 PHY)
+    ├── mqtt_service.h/.c       # MQTT wrapper — MAC node ID, topics, LWT, health, relays
     ├── app_mqtt.h/.c           # Thin ESP-IDF MQTT client wrapper
-    └── ds18b20_temp.h/.c       # DS18B20 1-Wire temperature service
+    ├── ds18b20_temp.h/.c       # DS18B20 1-Wire temperature service
+    ├── display_service.h/.c    # SSD1306 OLED service (clock + text zone)
+    ├── display_font.h          # Roboto Condensed Bold bitmap font
+    └── ethernet_service.h/.c   # LEGACY — superseded by network_service, not built
 ```
 
 ---
 
 ## Quick Start
 
-### 1. Clone and set up the IDF environment
+### 1. Set up the IDF environment
 
 ```bash
-git clone https://github.com/lalith-ais/esp-idf-supervisor.git
-cd esp-idf-supervisor
+cd control-node
 idf.py set-target esp32p4
 ```
 
@@ -148,15 +221,9 @@ idf.py set-target esp32p4
 idf.py menuconfig
 ```
 
-Set at minimum:
+The broker address is under **Example Configuration → MQTT Broker Uri** (`CONFIG_MQTT_BROKER_URI`, default `mqtt://192.168.124.4`). No per-unit settings are needed: the same binary can be flashed to every unit because identity comes from the MAC.
 
-| Key | Example Value |
-|-----|---------------|
-| `CONFIG_MQTT_BROKER_URI` | `mqtt://192.168.1.100` |
-| `CONFIG_ESP_TASK_WDT` | `y` |
-| `CONFIG_FREERTOS_HZ` | `1000` |
-
-> **Warning:** `CONFIG_MQTT_BROKER_URI` **must** be set. If absent the build will warn and use a placeholder that will fail to connect.
+Recommended: `CONFIG_ESP_TASK_WDT=y`, `CONFIG_FREERTOS_HZ=1000` (see [Build & Configuration](#build--configuration)).
 
 ### 3. Build and flash
 
@@ -165,167 +232,17 @@ idf.py build
 idf.py -p /dev/ttyACM0 flash monitor
 ```
 
-### 4. Expected boot log
+### 4. Check it works
 
-```
-
-I (25) boot: ESP-IDF v5.5.2 2nd stage bootloader
-I (26) boot: compile time Mar 10 2026 08:28:45
-I (26) boot: Multicore bootloader
-I (27) boot: chip revision: v1.3
-I (29) boot: efuse block revision: v0.3
-I (32) boot.esp32p4: SPI Speed      : 80MHz
-I (36) boot.esp32p4: SPI Mode       : DIO
-I (40) boot.esp32p4: SPI Flash Size : 32MB
-I (44) boot: Enabling RNG early entropy source...
-I (48) boot: Partition Table:
-I (51) boot: ## Label            Usage          Type ST Offset   Length
-I (57) boot:  0 nvs              WiFi data        01 02 00009000 00006000
-I (64) boot:  1 phy_init         RF data          01 01 0000f000 00001000
-I (70) boot:  2 factory          factory app      00 00 00010000 00100000
-I (78) boot: End of partition table
-I (80) esp_image: segment 0: paddr=00010020 vaddr=40080020 size=200c8h (131272) map
-I (110) esp_image: segment 1: paddr=000300f0 vaddr=30100000 size=00088h (   136) load
-I (112) esp_image: segment 2: paddr=00030180 vaddr=4ff00000 size=0fe98h ( 65176) load
-I (128) esp_image: segment 3: paddr=00040020 vaddr=40000020 size=7dd70h (515440) map
-I (215) esp_image: segment 4: paddr=000bdd98 vaddr=4ff0fe98 size=04c08h ( 19464) load
-I (221) esp_image: segment 5: paddr=000c29a8 vaddr=4ff14b00 size=02dd4h ( 11732) load
-I (229) boot: Loaded app from partition at offset 0x10000
-I (229) boot: Disabling RNG early entropy source...
-I (243) hex_psram: vendor id    : 0x0d (AP)
-I (243) hex_psram: Latency      : 0x01 (Fixed)
-I (243) hex_psram: DriveStr.    : 0x00 (25 Ohm)
-I (244) hex_psram: dev id       : 0x03 (generation 4)
-I (249) hex_psram: density      : 0x07 (256 Mbit)
-I (253) hex_psram: good-die     : 0x06 (Pass)
-I (257) hex_psram: SRF          : 0x02 (Slow Refresh)
-I (262) hex_psram: BurstType    : 0x00 ( Wrap)
-I (266) hex_psram: BurstLen     : 0x03 (2048 Byte)
-I (271) hex_psram: BitMode      : 0x01 (X16 Mode)
-I (275) hex_psram: Readlatency  : 0x04 (14 cycles@Fixed)
-I (280) hex_psram: DriveStrength: 0x00 (1/1)
-I (284) MSPI Timing: Enter psram timing tuning
-I (461) esp_psram: Found 32MB PSRAM device
-I (462) esp_psram: Speed: 200MHz
-I (462) hex_psram: psram CS IO is dedicated
-I (463) cpu_start: Multicore app
-I (1413) esp_psram: SPI SRAM memory test OK
-I (1422) cpu_start: GPIO 38 and 37 are used as console UART I/O pins
-I (1423) cpu_start: Pro cpu start user code
-I (1423) cpu_start: cpu freq: 360000000 Hz
-I (1425) app_init: Application information:
-I (1429) app_init: Project name:     esp-idf-supervisor
-I (1434) app_init: App version:      a3f94b1
-I (1438) app_init: Compile time:     Mar 10 2026 08:29:00
-I (1443) app_init: ELF file SHA256:  a41b5889a...
-I (1447) app_init: ESP-IDF:          v5.5.2
-I (1451) efuse_init: Min chip rev:     v0.1
-I (1455) efuse_init: Max chip rev:     v1.99 
-I (1459) efuse_init: Chip rev:         v1.3
-I (1463) heap_init: Initializing. RAM available for dynamic allocation:
-I (1469) heap_init: At 4FF1A640 len 00020980 (130 KiB): RETENT_RAM
-I (1475) heap_init: At 4FF3AFC0 len 00004BF0 (18 KiB): RAM
-I (1480) heap_init: At 4FF40000 len 00060000 (384 KiB): RAM
-I (1486) heap_init: At 50108080 len 00007F80 (31 KiB): RTCRAM
-I (1491) heap_init: At 30100088 len 00001F78 (7 KiB): TCM
-I (1497) esp_psram: Adding pool of 32768K of PSRAM memory to heap allocator
-I (1504) spi_flash: detected chip: gd
-I (1506) spi_flash: flash io: dio
-I (1510) sleep_gpio: Configure to isolate all GPIO pins in sleep state
-I (1516) sleep_gpio: Enable automatic switching of GPIO sleep configuration
-I (1523) main_task: Started on CPU0
-I (1553) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations
-I (1553) main_task: Calling app_main()
-I (1563) main: Bootloader starting. Heap free: 34082260
-I (1563) main: Initializing ESP-IDF networking stack...
-I (1563) main: ESP-IDF networking initialized
-I (1563) init: ========================================
-I (1573) init: INIT PROCESS STARTING (priority 24)
-I (1573) init: ========================================
-I (1583) init: Found 3 service(s) to start
-I (1583) init: Starting 1/3: ethernet
-I (1593) init: Started 'ethernet' (crash_count=0)
-I (1593) ethernet-super: Starting
-I (1593) boot: Supervisor task created
-I (1603) init:   -> state: READY
-I (1593) eth-service: Ethernet service starting
-I (1613) ethernet-super: Running
-I (1643) esp_eth.netif.netif_glue: 30:ed:a0:ea:53:25
-I (1643) esp_eth.netif.netif_glue: ethernet attached to netif
-I (1653) init: Starting 2/3: mqtt
-I (1653) init: Started 'mqtt' (crash_count=0)
-I (1653) mqtt-super: Starting
-I (1653) mqtt-service: MQTT service starting
-I (1653) mqtt-service: Waiting for Ethernet IP...
-I (1663) init:   -> state: READY
-I (1663) mqtt-super: Running
-I (1713) init: Starting 3/3: ds18b20-temp
-I (1713) init: Started 'ds18b20-temp' (crash_count=0)
-I (1713) ds18b20-super: DS18B20 temperature supervisor starting
-I (1713) ds18b20-temp: Initialising DS18B20 on GPIO6
-I (1723) init:   -> state: RUNNING
-I (1773) debug: === SYSTEM DEBUG ===
-I (1773) debug: Heap free: 33989596  min-ever: 33989596
-I (1773) debug: Services registered: 3
-I (1773) debug:   [0] ethernet              state=BLOCKED     crashes=0  stack_free=10460
-I (1773) debug:   [1] mqtt                  state=BLOCKED     crashes=0  stack_free=6092
-I (1783) debug:   [2] ds18b20-temp          state=BLOCKED     crashes=0  stack_free=2200
-I (1793) init: All services started. Entering supervision loop...
-I (1823) ds18b20-temp: Found DS18B20[0] addr=D506473B2D600028
-I (1923) ds18b20-temp: Found DS18B20[1] addr=6805473B4A510028
-I (2023) ds18b20-temp: Found DS18B20[2] addr=4706473B10350028
-I (2023) ds18b20-temp: Found 3 sensor(s)
-I (2023) ds18b20-temp: Service started (3 sensor(s))
-I (2023) ds18b20-temp: Task starting
-I (2033) ds18b20-super: Running
-I (2603) main: Bootloader exiting, supervisor in control
-W (2663) mqtt-super: No Ethernet IP — MQTT service will handle reconnection
-W (3663) mqtt-super: No Ethernet IP — MQTT service will handle reconnection
-I (4443) ethernet_setup: Ethernet initialized successfully
-I (4443) eth-service: Running -- waiting for events...
-I (4443) ethernet_setup: Ethernet Started
-I (4443) ethernet_setup: Ethernet Link Up
-I (4443) ethernet_setup: MAC: 30:ed:a0:ea:53:25
-W (4663) mqtt-super: No Ethernet IP — MQTT service will handle reconnection
-I (5253) ds18b20-temp: Sensor[0]: 16.44°C (count=0)
-I (5253) ds18b20-super: Sensor[0]: 16.44°C
-I (5263) ds18b20-temp: Sensor[1]: 16.31°C (count=0)
-I (5263) ds18b20-super: Sensor[1]: 16.31°C
-I (5273) ds18b20-temp: Sensor[2]: 16.81°C (count=0)
-I (5273) ds18b20-super: Sensor[2]: 16.81°C
-I (5443) ethernet-super: Ethernet connected
-I (5453) ethernet_setup: Got IP Address
-I (5453) ethernet_setup: IP:      192.168.124.90
-I (5453) ethernet_setup: Netmask: 255.255.255.0
-I (5453) ethernet_setup: Gateway: 192.168.124.1
-I (5453) ethernet-super: Got IP: 192.168.124.90
-I (5453) esp_netif_handlers: eth ip: 192.168.124.90, mask: 255.255.255.0, gw: 192.168.124.1
-W (5663) mqtt-super: No Ethernet IP — MQTT service will handle reconnection
-I (6443) ethernet-super: Got IP: 192.168.124.90
-I (6653) mqtt-service: Connecting to broker: mqtt://192.168.124.4 (LWT: /ESP32P4/NODE1/status = offline)
-I (6653) app-mqtt: LWT configured: topic=/ESP32P4/NODE1/status msg=offline qos=1 retain=1
-I (6653) app-mqtt: MQTT client initialised: broker=mqtt://192.168.124.4 client_id=ESP32P4-ETH
-I (6663) mqtt-super: MQTT service started
-I (6663) mqtt-service: Running
-I (6663) mqtt-service: Health publish task started
-I (6673) app-mqtt: MQTT_EVENT_CONNECTED
-I (6673) mqtt-service: MQTT connected
-I (6683) mqtt-service: Published: /ESP32P4/NODE1/status = online (retained)
-I (6683) mqtt-super: MQTT connected
-I (7673) mqtt-super: Published to /ESP32P4/NODE1/health, msg_id=53839
-I (7673) mqtt-service: Health: {"uptime_s":0,"heap_free":33973708,"ip":"192.168.124.90"}
-I (13513) ds18b20-temp: Sensor[0]: 16.50°C (count=0)
-I (13513) ds18b20-super: Sensor[0]: 16.50°C
-I (13513) ds18b20-temp: Published /ESP32P4/temperature/0 → 16.50
-I (13533) ds18b20-temp: Sensor[1]: 16.38°C (count=1)
-I (13533) ds18b20-super: Sensor[1]: 16.38°C
-I (13533) ds18b20-temp: Published /ESP32P4/temperature/1 → 16.38
-I (13543) ds18b20-temp: Sensor[2]: 16.88°C (count=2)
-I (13543) ds18b20-super: Sensor[2]: 16.88°C
-I (13543) ds18b20-temp: Published /ESP32P4/temperature/2 → 16.88
-
-
-```
+1. In the boot log, find the node ID and subscriptions:
+   ```
+   Node MAC ID: 30EDA0EA52E4
+   Subscribed: /30EDA0EA52E4/relay1 -> GPIO23
+   ...
+   Published: /30EDA0EA52E4/status = online (retained)
+   ```
+2. Watch the unit: `mosquitto_sub -h <broker> -t '/<MAC>/#' -v` — you should see `status`, `health` and `temperature` messages.
+3. Switch a relay: `mosquitto_pub -h <broker> -t /<MAC>/relay1 -m on`.
 
 ---
 
@@ -336,13 +253,14 @@ Defined in `priorities.h`. **Never use numeric literals** for task priorities in
 | Constant | Value | Task |
 |----------|-------|------|
 | `PRIO_SUPERVISOR` | 24 | supervisor (init) — must be highest |
-| `PRIO_ETH_SUPERVISOR` | 23 | `ethernet_supervisor` wrapper |
-| `PRIO_ETH_SERVICE` | 22 | `eth-service` inner task |
+| `PRIO_ETH_SUPERVISOR` | 23 | `network_supervisor` wrapper |
+| `PRIO_ETH_SERVICE` | 22 | network service inner task |
 | `PRIO_MQTT_SUPERVISOR` | 20 | `mqtt_supervisor` wrapper |
 | `PRIO_MQTT_SERVICE` | 19 | `mqtt-service` inner task |
-| `PRIO_DS18B20_SUPERVISOR` | 10 | `ds18b20_temp_supervisor` wrapper |
-| `PRIO_MQTT_PUBLISH` | 5 | `mqtt-publish` inner task |
+| `PRIO_DS18B20_SUPERVISOR` | 10 | `ds18b20_temp_supervisor` and `display_supervisor` wrappers |
+| `PRIO_MQTT_PUBLISH` | 5 | `mqtt-publish` (health) inner task |
 | `PRIO_DS18B20_SERVICE` | 5 | `ds18b20-temp` inner task |
+| `PRIO_DISPLAY_SERVICE` | 4 | `display` inner task |
 
 The supervisor enforces that no service may have a priority >= `PRIO_SUPERVISOR`. Any attempt to register such a service is rejected with an error log.
 
@@ -393,8 +311,15 @@ Crash 4+ →  8 000 ms  (capped)
 // `services` is a NULL-terminated array of service_def_t.
 void supervisor_start(const service_def_t *services);
 
-// Returns true if every service marked essential=true is currently alive.
+// Returns true if every essential service is alive and not stuck.
 bool supervisor_is_healthy(void);
+
+// Called by a service task to report liveness (see heartbeat_timeout_s).
+void supervisor_heartbeat(const char *name);
+
+// Name of the last essential service that forced a reboot (read from NVS), or NULL.
+// Included as "crash" in the /<MAC>/health JSON when present.
+const char *supervisor_get_last_crash(void);
 ```
 
 #### `service_def_t` fields
@@ -408,17 +333,21 @@ typedef struct {
     restart_policy_t  restart;     // RESTART_NEVER / RESTART_ALWAYS / RESTART_ON_CRASH
     bool              essential;   // If true and unrecoverable → esp_restart()
     void             *context;     // Passed as arg to entry()
+    uint16_t          heartbeat_timeout_s; // 0 = disabled; else service must call
+                                           // supervisor_heartbeat(name) within this time
 } service_def_t;
 ```
 
-#### Service registry example (`system.c`)
+#### Service registry (`system.c`)
 
 ```c
 const service_def_t services[] = {
-    {"ethernet",     ethernet_supervisor,     12288, PRIO_ETH_SUPERVISOR,    RESTART_ALWAYS, true,  NULL},
-    {"mqtt",         mqtt_supervisor,          8192, PRIO_MQTT_SUPERVISOR,   RESTART_ALWAYS, false, NULL},
-    {"ds18b20-temp", ds18b20_temp_supervisor,  4096, PRIO_DS18B20_SUPERVISOR,RESTART_ALWAYS, false, NULL},
-    {NULL, NULL, 0, 0, RESTART_NEVER, false, NULL}  // sentinel
+    /* name          entry                   stack  priority                 restart         essential ctx   hb_s */
+    {"ethernet",     network_supervisor,     12288, PRIO_ETH_SUPERVISOR,     RESTART_ALWAYS, true,  NULL, 30},
+    {"mqtt",         mqtt_supervisor,         8192, PRIO_MQTT_SUPERVISOR,    RESTART_ALWAYS, false, NULL, 30},
+    {"ds18b20-temp", ds18b20_temp_supervisor, 4096, PRIO_DS18B20_SUPERVISOR, RESTART_ALWAYS, false, NULL, 60},
+    {"display",      display_supervisor,      4096, PRIO_DS18B20_SUPERVISOR, RESTART_ALWAYS, false, NULL, 0},
+    {NULL, NULL, 0, 0, RESTART_NEVER, false, NULL, 0}  /* sentinel */
 };
 ```
 
@@ -426,32 +355,36 @@ const service_def_t services[] = {
 
 ## Services
 
-### Ethernet Service
+### Network Service
 
-Files: `ethernet_service.h/.c`, `ethernet_setup.h/.c`
+Files: `network_service.h/.c`, `network_transport.h`, `ethernet_transport.h/.c`, `ethernet_setup.h/.c`
+
+`network_service.h` is the only networking header the rest of the application includes. It exposes no transport concepts, so Ethernet can be replaced by WiFi by changing the transport pointer passed to `network_service_start()` in `network_supervisor()` (`system.c`).
 
 #### Event Types
 
 ```c
 typedef enum {
-    ETH_EVENT_CONNECTED,     // Physical link up — MAC address available
-    ETH_EVENT_DISCONNECTED,  // Physical link lost
-    ETH_EVENT_GOT_IP,        // DHCP lease obtained
-    ETH_EVENT_STARTED,       // Ethernet driver started
-    ETH_EVENT_STOPPED,       // Ethernet driver stopped
-    ETH_EVENT_ERROR          // Hardware error — wrapper task exits
-} eth_event_type_t;
+    NET_EVENT_CONNECTED,        // link up — MAC address available
+    NET_EVENT_DISCONNECTED,     // link lost
+    NET_EVENT_GOT_IP,           // DHCP lease obtained
+    NET_EVENT_STARTED,
+    NET_EVENT_STOPPED,
+    NET_EVENT_ERROR,            // unrecoverable hardware error
+    NET_EVENT_STOP_REQUESTED    // sent by network_service_stop()
+} net_event_type_t;
 ```
 
 #### Public API
 
 ```c
-void           ethernet_service_start(void);
-void           ethernet_service_stop(void);
-QueueHandle_t  ethernet_service_get_queue(void);   // Items: eth_service_message_t
-bool           ethernet_service_is_connected(void);
-bool           ethernet_service_has_ip(void);
-const char    *ethernet_service_get_ip(void);
+void           network_service_start(const network_transport_t *transport);
+void           network_service_stop(void);
+QueueHandle_t  network_service_get_queue(void);   // Items: net_service_message_t
+bool           network_service_is_connected(void);
+bool           network_service_has_ip(void);
+const char    *network_service_get_ip(void);
+esp_err_t      network_service_get_mac(uint8_t mac[6]);   // used for node-ID derivation
 ```
 
 ---
@@ -460,23 +393,28 @@ const char    *ethernet_service_get_ip(void);
 
 Files: `mqtt_service.h/.c`, `app_mqtt.h/.c`
 
-#### sdkconfig Keys
+Start-up sequence in `mqtt_service_task()`:
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `CONFIG_MQTT_BROKER_URI` | *(required)* | Full broker URI, e.g. `mqtt://192.168.1.100` |
-| `CONFIG_MQTT_CLIENT_ID` | `ESP32P4-ETH` | MQTT client identifier |
-| `CONFIG_MQTT_PUBLISH_TOPIC` | `/ESP32P4/NODE1` | Outgoing telemetry topic |
-| `CONFIG_MQTT_SUBSCRIBE_TOPIC` | `/ESP32P4/COMMAND` | Incoming command topic |
-| `CONFIG_MQTT_PUBLISH_INTERVAL_MS` | `5000` | Publish interval (ms) |
+1. `relay_gpio_init()` — relay pins 23/26/27/32 configured as outputs, all LOW.
+2. Wait up to 10 s for a non-zero MAC from the network service.
+3. Derive `s_mac_id` (12-char upper-hex) and build client ID, publish/subscribe topics and LWT topic.
+4. Wait for an IP, connect to the broker (LWT `/<MAC>/status` = `offline`, QoS 1, retained).
+5. On connect: subscribe to `/<MAC>/cmd`, `/SYS/time`, `/<MAC>/text`, `/<MAC>/relay1..4`; publish `online` (retained).
+6. A health task publishes the JSON health payload every 30 s.
 
-#### Supported Commands (subscribe topic payload)
+`s_mac_id` is a global defined in `mqtt_service.c` and referenced via `extern` by `ds18b20_temp.c`; it is only valid after step 3.
 
-| Payload | Action |
-|---------|--------|
-| `led_on` | Log message (extend to drive GPIO) |
-| `led_off` | Log message (extend to drive GPIO) |
-| `reboot` | Log message (extend to call `esp_restart()`) |
+#### Configuration
+
+| Key | Default | Where | Description |
+|-----|---------|-------|-------------|
+| `CONFIG_MQTT_BROKER_URI` | `mqtt://192.168.124.4` | `Kconfig.projbuild` (menuconfig) | Broker URI |
+| `CONFIG_MQTT_CLIENT_ID_PREFIX` | `""` | compile-time fallback in `mqtt_service.c` | Prefix for client ID |
+| `CONFIG_MQTT_TOPIC_ROOT` | `""` | compile-time fallback in `mqtt_service.c` | Prefix for all topics |
+| `CONFIG_MQTT_PUBLISH_INTERVAL_MS` | `5000` | compile-time fallback | Publish interval |
+| `CONFIG_MQTT_HEALTH_INTERVAL_MS` | `30000` | compile-time fallback | Health JSON interval |
+
+Only the broker URI has a Kconfig entry. The others are `#ifndef` fallbacks, so changing them means adding Kconfig entries or passing `-D` flags. If you change `CONFIG_MQTT_TOPIC_ROOT`, also change `MQTT_TOPIC_ROOT` in `ds18b20_temp.c`, which is hard-coded to `""`.
 
 #### Public API
 
@@ -496,11 +434,15 @@ void           mqtt_service_set_config(const mqtt_config_t *config);
 void           mqtt_service_get_config(mqtt_config_t *config);
 ```
 
+Incoming messages are dispatched in `mqtt_message_callback()` (runs in the ESP-IDF MQTT client context): relay topics → GPIO, `/<MAC>/text` and `/SYS/time` → display service, and every message is also forwarded to the service queue as `MQTT_SERVICE_EVENT_MESSAGE_RECEIVED`. Topic buffers are 128 bytes and payload buffers 512 bytes in `app_mqtt.c`; the queue copy is truncated to 63/255 chars.
+
 ---
 
 ### DS18B20 Temperature Service
 
 Files: `ds18b20_temp.h/.c`
+
+Every 30 s the service triggers a conversion on all sensors, pushes a `ds18b20_reading_t` per sensor on its event queue, and publishes the value (`%.2f`, QoS 0, not retained) to MQTT.
 
 #### Configuration
 
@@ -508,11 +450,9 @@ Files: `ds18b20_temp.h/.c`
 |----------|---------|-------------|
 | `DS18B20_MAX_SENSORS` | `4` | Maximum sensors enumerated on the bus |
 | `DS18B20_DEFAULT_GPIO` | `6` | GPIO pin for 1-Wire data line |
-| `HEALTH_STALE_S` | `30` | Seconds without a reading before `is_healthy()` returns false |
+| `HEALTH_STALE_S` | `120` | Seconds without a reading before `is_healthy()` returns false |
 
 #### Reading Queue
-
-The service pushes `ds18b20_reading_t` structs onto the event queue after each successful conversion:
 
 ```c
 typedef struct {
@@ -525,8 +465,10 @@ typedef struct {
 
 | Topic | Condition |
 |-------|-----------|
-| `/ESP32P4/temperature` | Single sensor on bus |
-| `/ESP32P4/temperature/N` | Multiple sensors — N is zero-based sensor index |
+| `/<MAC>/temperature` | exactly one sensor on the bus |
+| `/<MAC>/temperature/N` | more than one sensor — `N` is the zero-based enumeration index |
+
+Index order is the 1-Wire search order (the sensor ROM addresses are logged at boot), not a fixed physical position. Record which index is which sensor when you install them.
 
 #### Public API
 
@@ -541,6 +483,32 @@ float          ds18b20_temp_service_get_last_temperature(int sensor_index);
 uint32_t       ds18b20_temp_service_get_message_count(void);
 esp_err_t      ds18b20_temp_service_trigger_conversion(void);
 ```
+
+---
+
+### Display Service
+
+Files: `display_service.h/.c`, `display_font.h`
+
+128×64 SSD1306 on I2C (SDA GPIO 7, SCL GPIO 8, address `0x3C`, overridable via `CONFIG_OLED_SDA_GPIO` / `CONFIG_OLED_SCL_GPIO` / `CONFIG_OLED_I2C_ADDR`).
+
+| Rows | Content |
+|------|---------|
+| 0–15 | Clock `HH:MM` (from `/SYS/time`) |
+| 16–55 | Two centred text lines (from `/<MAC>/text`), word-wrapped; `\n` forces a break; empty payload clears |
+
+On MQTT disconnect the clock shows `----` and the text is cleared. Text is truncated at 63 characters.
+
+```c
+void display_service_start(void);
+void display_service_stop(void);
+bool display_service_is_running(void);
+void display_service_set_time(const char *time_str);   // "HH:MM"
+void display_service_set_text(const char *text);       // thread-safe, non-blocking
+void display_service_set_mqtt_connected(bool connected);
+```
+
+> The header comment in `display_service.h` still mentions the old `/controller/text` topic. The code actually subscribes to `/<MAC>/text`.
 
 ---
 
@@ -640,8 +608,8 @@ void my_supervisor(void *arg) {
 ```c
 const service_def_t services[] = {
     // ... existing entries ...
-    {"my-service", my_supervisor, 4096, PRIO_MY_SUPERVISOR, RESTART_ALWAYS, false, NULL},
-    {NULL, NULL, 0, 0, RESTART_NEVER, false, NULL}  // sentinel — keep last
+    {"my-service", my_supervisor, 4096, PRIO_MY_SUPERVISOR, RESTART_ALWAYS, false, NULL, 0},
+    {NULL, NULL, 0, 0, RESTART_NEVER, false, NULL, 0}  // sentinel — keep last
 };
 ```
 
@@ -660,8 +628,8 @@ idf_component_register(
 
 ### Prerequisites
 
-- ESP-IDF v5.x with `IDF_PATH` set
-- `espressif__onewire_bus` component (listed under `PRIV_REQUIRES`)
+- ESP-IDF v5.x (tested with v5.5.2) with `IDF_PATH` set
+- Components pulled by the IDF component manager: `espressif/ds18b20` (`main/idf_component.yml`) and `espressif__onewire_bus`
 - Target set: `idf.py set-target esp32p4`
 
 ### CMakeLists.txt (main component)
@@ -672,16 +640,16 @@ idf_component_register(
         "main.c"
         "supervisor.c"
         "system.c"
-        "ethernet_service.c"
+        "network_service.c"
+        "ethernet_transport.c"
         "ethernet_setup.c"
         "mqtt_service.c"
         "app_mqtt.c"
         "ds18b20_temp.c"
+        "display_service.c"
     INCLUDE_DIRS "."
-    REQUIRES
-        esp_timer nvs_flash esp_eth esp_netif driver mqtt
-    PRIV_REQUIRES
-        espressif__onewire_bus
+    REQUIRES esp_timer nvs_flash esp_eth esp_netif driver mqtt esp_lcd
+    PRIV_REQUIRES espressif__onewire_bus
 )
 ```
 
@@ -707,12 +675,43 @@ idf_component_register(
 | ETH PHY Reset | 51 | Active-low, driven by driver |
 | ETH PHY Address | — | Strapped to 1 |
 | DS18B20 1-Wire | 6 | Internal pull-up enabled via RMT config |
+| OLED SDA | 7 | I2C, address 0x3C |
+| OLED SCL | 8 | I2C |
+| Relay 1 | 23 | `/<MAC>/relay1`, active-high |
+| Relay 2 | 26 | `/<MAC>/relay2`, active-high |
+| Relay 3 | 27 | `/<MAC>/relay3`, active-high |
+| Relay 4 | 32 | `/<MAC>/relay4`, active-high |
+| Console UART | 37 / 38 | ESP32-P4 default console pins (from boot log) |
 
 > For 1-Wire cable runs longer than ~20 cm, use an external **4.7 kΩ** pull-up resistor to 3.3 V.
+>
+> Relay outputs are 3.3 V logic straight from the GPIO. Drive real relays through a transistor/driver stage or an opto-isolated relay board; never switch a coil directly from the pin.
 
 ---
 
+## Known Issues & Limitations
 
+- **`/<MAC>/cmd` is a stub.** `led_on`, `led_off` and `reboot` only log a message; no GPIO is driven and `esp_restart()` is not called.
+- **No relay state feedback.** Relay state is not published and not persisted; a node reboot turns all relays off (a retained command on the broker will re-apply on reconnect).
+- **Active-high relays only**, and strict payload match (`on`/`off`, case-insensitive; trailing whitespace or newline is rejected).
+- **Topic root is not fully configurable.** `MQTT_TOPIC_ROOT` in `ds18b20_temp.c` is hard-coded to `""` and must be kept in step with `CONFIG_MQTT_TOPIC_ROOT`; only the broker URI has a Kconfig entry.
+- **Single shared clock.** `/SYS/time` is not per-unit.
+- **Stale comments.** Header comments in `ds18b20_temp.c` mention `/ESP32P4/<MAC>/temperature` and `display_service.h` mentions `/controller/text`; the live topics are `/<MAC>/temperature` and `/<MAC>/text`.
+- **Legacy files.** `ethernet_service.h/.c` are superseded by `network_service` and are not in the build.
+- **No authentication/TLS.** The client connects to `mqtt://` on a trusted LAN; anyone who can reach the broker can switch the relays.
+
+---
+
+## Changelog
+
+### Current
+- Transport-agnostic `network_service` replaces `ethernet_service`
+- MAC-derived node ID, client ID and topics (`/<MAC>/…`)
+- LWT status topic and 30 s health JSON
+- Four MQTT-controlled relays (GPIO 23, 26, 27, 32)
+- DS18B20 temperatures published per unit
+- SSD1306 display service (clock + text zone)
+- Supervisor heartbeat checks and NVS crash record
 
 ### v1.0 (February 2025)
 
